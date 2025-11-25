@@ -561,7 +561,7 @@ def control_loop(
     env: gym.Env,
     env_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
     action_processor: DataProcessorPipeline[EnvTransition, EnvTransition],
-    teleop_device: Teleoperator,
+    teleop_device: Teleoperator | None,
     cfg: GymManipulatorConfig,
 ) -> None:
     """Main control loop for robot environment interaction.
@@ -599,7 +599,21 @@ def control_loop(
 
     dataset = None
     if cfg.mode == "record":
-        action_features = teleop_device.action_features
+        if teleop_device is not None:
+            action_features = teleop_device.action_features
+        else:
+            action_space = getattr(env, "action_space", None)
+            if isinstance(action_space, gym.spaces.Box):
+                action_features = {
+                    "dtype": np.dtype(action_space.dtype).name,
+                    "shape": action_space.shape,
+                    "names": None,
+                }
+            else:
+                raise ValueError(
+                    "Unable to infer action feature spec without a teleoperator for action space "
+                    f"type {type(action_space).__name__}"
+                )
         features = {
             ACTION: action_features,
             REWARD: {"dtype": "float32", "shape": (1,), "names": None},
@@ -692,16 +706,19 @@ def control_loop(
             logging.info(
                 f"Episode ended after {episode_step} steps in {episode_time:.1f}s with reward {transition[TransitionKey.REWARD]}"
             )
+            print(
+                f"Episode ended after {episode_step} steps in {episode_time:.1f}s with reward {transition[TransitionKey.REWARD]}"
+            )
             episode_step = 0
             episode_idx += 1
 
             if dataset is not None:
                 if transition[TransitionKey.INFO].get(TeleopEvents.RERECORD_EPISODE, False):
-                    logging.info(f"Re-recording episode {episode_idx}")
+                    print(f"Re-recording episode {episode_idx}")
                     dataset.clear_episode_buffer()
                     episode_idx -= 1
                 else:
-                    logging.info(f"Saving episode {episode_idx}")
+                    print(f"Saving episode {episode_idx}")
                     dataset.save_episode()
 
             # Reset for new episode
@@ -716,6 +733,8 @@ def control_loop(
         busy_wait(dt - (time.perf_counter() - step_start_time))
 
     if dataset is not None and cfg.dataset.push_to_hub:
+        dataset.finalize()
+
         logging.info("Pushing dataset to hub")
         dataset.push_to_hub()
 
