@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .config_omega3 import Omega3Config
-from .teleop_omega3 import Omega3
+from .config_omega3 import ForceDimensionOmegaConfig
+from .teleop_omega3 import ForceDimensionOmega
 
-__all__ = ["Omega3", "Omega3Config"]
+__all__ = ["ForceDimensionOmega", "ForceDimensionOmegaConfig"]

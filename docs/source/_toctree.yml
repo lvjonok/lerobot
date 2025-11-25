@@ -84,7 +84,7 @@
   - local: phone_teleop
     title: Phone
   - local: omega3_teleop
-    title: Omega.3
+    title: Force Dimension Omega
   title: "Teleoperators"
 - sections:
   - local: notebooks

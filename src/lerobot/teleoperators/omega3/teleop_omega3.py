@@ -23,7 +23,7 @@ from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 from lerobot.utils.rotation import Rotation
 
-from .config_omega3 import Omega3Config
+from .config_omega3 import ForceDimensionOmegaConfig
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,7 @@ else:
 def _ensure_sdk_available() -> None:
     if _IMPORT_ERROR is not None:
         raise ImportError(
-            "The Omega3 teleoperator requires the Force Dimension Python bindings. "
+            "The Force Dimension Omega teleoperator requires the Force Dimension Python bindings. "
             "Install them via `pip install lerobot[omega3]`."
         ) from _IMPORT_ERROR
 
@@ -51,19 +51,21 @@ def _identity_rotation() -> Rotation:
     return Rotation.from_quat(np.array([0.0, 0.0, 0.0, 1.0], dtype=float))
 
 
-class Omega3(Teleoperator):
+class ForceDimensionOmega(Teleoperator):
     """
-    Teleoperator for the Force Dimension Omega.3 haptic device.
+    Teleoperator for the Force Dimension Omega haptic devices (Omega.3 / Omega.6 / Omega.7).
 
     The driver exposes calibrated deltas in translation and rotation, matching the expected
     target action format (`target_*` keys) used by the default teleoperation pipelines.
     """
 
-    config_class = Omega3Config
-    name = "omega3"
+    config_class = ForceDimensionOmegaConfig
+    name = "force_dimension_omega"
 
-    def __init__(self, config: Omega3Config):
+    def __init__(self, config: ForceDimensionOmegaConfig):
         _ensure_sdk_available()
+        # Use the config type (omega3 / omega6 / etc.) as the calibration namespace.
+        self.name = config.type
         super().__init__(config)
         self.config = config
         self._device_id: int | None = None
@@ -84,7 +86,7 @@ class Omega3(Teleoperator):
             "target_wy": float,
             "target_wz": float,
             "gripper_vel": float,
-            "omega3.button_mask": int,
+            "omega.button_mask": int,
         }
 
     @property
@@ -102,12 +104,12 @@ class Omega3(Teleoperator):
 
         device_id = self._open_device()
         if device_id < 0:
-            self._raise_last_error("Unable to open Omega.3 device")
+            self._raise_last_error(f"Unable to open {self._device_label} device")
         self._device_id = device_id
 
         # Disable force output for passive teleoperation.
         dhd.enableForce(False, self._device_id)
-        logger.info("Connected to Omega.3 (id=%s, serial=%s)", self._device_id, self._serial_number())
+        logger.info("Connected to %s (id=%s, serial=%s)", self._device_label, self._device_id, self._serial_number())
 
         if calibrate:
             self.calibrate()
@@ -145,7 +147,7 @@ class Omega3(Teleoperator):
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
         print(
-            "Hold the Omega.3 handle in the neutral pose you want to consider as zero "
+            "Hold the Force Dimension Omega handle in the neutral pose you want to consider as zero "
             "and press ENTER to capture it."
         )
         input("Ready? Press ENTER to capture the reference pose...")
@@ -158,7 +160,7 @@ class Omega3(Teleoperator):
         self._zero_pos, self._zero_rot = pose
         self._enabled = False
         self._has_reference = True
-        logger.info("Captured new Omega.3 neutral pose.")
+        logger.info("Captured new %s neutral pose.", self._device_label)
 
     @property
     def is_calibrated(self) -> bool:
@@ -213,7 +215,7 @@ class Omega3(Teleoperator):
             "target_wy": float(scaled_rot[1]),
             "target_wz": float(scaled_rot[2]),
             "gripper_vel": gripper_vel,
-            "omega3.button_mask": button_mask,
+            "omega.button_mask": button_mask,
         }
 
         self._enabled = enabled
@@ -254,7 +256,7 @@ class Omega3(Teleoperator):
             return 0
         mask = dhd.getButtonMask(self._device_id)
         if mask < 0:
-            self._log_last_error("Failed to read Omega.3 button mask")
+            self._log_last_error(f"Failed to read {self._device_label} button mask")
             return self._last_button_mask
         return mask
 
@@ -271,11 +273,11 @@ class Omega3(Teleoperator):
                 # Fallback to position-only devices.
                 err = dhd.getPosition(pos_buf, self._device_id)
                 if err < 0:
-                    self._log_last_error("Failed to read Omega.3 position")
+                    self._log_last_error(f"Failed to read {self._device_label} position")
                     return None
                 return np.array(pos_buf, dtype=float), self._zero_rot
 
-            self._log_last_error("Failed to read Omega.3 pose")
+            self._log_last_error(f"Failed to read {self._device_label} pose")
             return None
 
         pos = np.array(pos_buf, dtype=float)
@@ -283,16 +285,20 @@ class Omega3(Teleoperator):
         return pos, Rotation.from_matrix(rot_matrix)
 
     def send_feedback(self, feedback: dict[str, Any]) -> None:
-        raise NotImplementedError("Omega.3 force feedback is not implemented yet.")
+        raise NotImplementedError("Force Dimension Omega force feedback is not implemented yet.")
 
     def disconnect(self) -> None:
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
         dhd.close(self._device_id)
-        logger.info("Disconnected Omega.3 (id=%s)", self._device_id)
+        logger.info("Disconnected %s (id=%s)", self._device_label, self._device_id)
         self._device_id = None
         self._enabled = False
+
+    @property
+    def _device_label(self) -> str:
+        return str(self.config.device_type or self.config.type).upper()
 
     def _raise_last_error(self, message: str) -> None:
         err = self._format_last_error()

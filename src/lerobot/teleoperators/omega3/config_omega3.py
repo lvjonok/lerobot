@@ -20,15 +20,16 @@ from ..config import TeleoperatorConfig
 
 
 @TeleoperatorConfig.register_subclass("omega3")
+@TeleoperatorConfig.register_subclass("omega6")
 @dataclass
-class Omega3Config(TeleoperatorConfig):
+class ForceDimensionOmegaConfig(TeleoperatorConfig):
     """
-    Configuration for the Force Dimension Omega.3 teleoperator.
+    Configuration for the Force Dimension Omega teleoperators (Omega.3, Omega.6, Omega.7, ...).
 
     Attributes:
         device_index: Select a specific device by index as reported by the SDK.
         serial_number: Select a specific device by serial number (if supported).
-        device_type: Name of the DeviceType enum to open, defaults to ``OMEGA3``.
+        device_type: Name (or enum value) of the DeviceType to open. Defaults depend on ``config.type``.
         translation_scale: Global scale applied to linear deltas (in meters).
         rotation_scale: Global scale applied to rotation deltas (in radians).
         translation_deadband_m: Threshold under which linear motion is ignored.
@@ -42,7 +43,7 @@ class Omega3Config(TeleoperatorConfig):
 
     device_index: int | None = None
     serial_number: int | None = None
-    device_type: str = "OMEGA3"
+    device_type: str | int | None = None
 
     translation_scale: float = 1.0
     rotation_scale: float = 1.0
@@ -63,3 +64,9 @@ class Omega3Config(TeleoperatorConfig):
             raise ValueError("serial_number must be non-negative when provided.")
         if self.device_index is not None and self.serial_number is not None:
             raise ValueError("Only one of device_index or serial_number can be set.")
+        if self.device_type is None:
+            # Default to the most likely target based on the registered config type.
+            if self.type == "omega6":
+                self.device_type = "OMEGA6_RIGHT"
+            else:
+                self.device_type = "OMEGA3"
