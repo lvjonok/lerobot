@@ -1,0 +1,85 @@
+# Omega.3 Teleoperation
+
+The Force Dimension **Omega.3** handle can be used as a six degree-of-freedom teleoperator in LeRobot.
+This page covers the software prerequisites, configuration knobs, and a quickstart for plugging it into
+the existing teleoperation scripts.
+
+## Install the dependencies
+
+1. Install the Force Dimension SDK from the [official download page](https://www.forcedimension.com/software)
+   and ensure the shared libraries are available on your system path (or set the `FDSDK` environment variable
+   to the SDK root as described in the vendor documentation).
+2. Install the Python bindings by installing the new optional extra:
+
+```bash
+pip install "lerobot[omega3]"
+```
+
+> The extra pulls the [`forcedimension-core`](https://forcedimension-core-python-docs.readthedocs.io/)
+> package that exposes the Omega device APIs.
+
+## Python API example
+
+```python
+from lerobot.teleoperators.omega3 import Omega3, Omega3Config
+
+omega_cfg = Omega3Config(
+    id="omega3_left",
+    # Optional: lock onto a specific device instance
+    device_index=0,
+    # Button 0 (default) enables teleop and captures a fresh neutral pose when pressed.
+    enable_button_index=0,
+    # Scale translational motion (meters) and rotation (radians) to match your workspace.
+    translation_scale=0.25,
+    rotation_scale=0.5,
+    # Map the two buttons next to the handle to gripper velocity.
+    gripper_open_button_index=1,
+    gripper_close_button_index=2,
+    gripper_speed=1.0,
+)
+
+teleop = Omega3(omega_cfg)
+teleop.connect()
+
+# Hold the handle where you want zero motion and press ENTER when prompted.
+teleop.calibrate()
+
+while True:
+    action = teleop.get_action()
+    # action already contains the `target_*` keys expected by the default pipelines.
+```
+
+The teleoperator reports:
+
+- `enabled`: `True` while the enable button is pressed.
+- `target_x/y/z` and `target_wx/wy/wz`: deltas relative to the neutral pose.
+- `gripper_vel`: derived from the optional button mapping.
+- `omega3.button_mask`: a raw 32-bit button mask, useful for custom logic.
+
+Whenever the enable button transitions from *released* to *pressed*, the driver re-centers the neutral pose.
+You can disable this behavior with `recenter_on_enable=False`.
+
+## CLI usage
+
+Any CLI that accepts teleoperator configs can now point to the Omega.3 driver:
+
+```bash
+lerobot-teleoperate \
+  --teleop.type=omega3 \
+  --teleop.id=omega3_left \
+  --teleop.translation_scale=0.25 \
+  --teleop.rotation_scale=0.5 \
+  --teleop.enable_button_index=0 \
+  --teleop.gripper_open_button_index=1 \
+  --teleop.gripper_close_button_index=2 \
+  --robot.type=so101_follower \
+  --robot.port=/dev/tty.usbmodem123456 \
+  --display_data=true
+```
+
+Use `--teleop.serial_number=XXXXX` or `--teleop.device_index=0` if you need to select a specific device
+when multiple Omega handles are attached. All other fields from `Omega3Config` can be overridden with the
+same dotted syntax.
+
+That's it—you can now swap the Omega.3 in anywhere the default teleoperation pipelines expect end-effector
+delta commands, without additional action processors.
