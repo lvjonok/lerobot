@@ -14,12 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .config import RobotConfig
-from .robot import Robot
-from .utils import make_robot_from_config
+from .config_ur import URRobotConfig
+from .ur_robot import URRobot
 
-# Register optional robots so their config types are available to the CLI.
-try:  # pragma: no cover - optional dependency
-    from .ur import URRobot, URRobotConfig  # noqa: F401
-except ImportError:
-    pass
+__all__ = ["URRobot", "URRobotConfig"]

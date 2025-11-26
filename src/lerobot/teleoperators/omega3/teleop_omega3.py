@@ -211,9 +211,10 @@ class ForceDimensionOmega(Teleoperator):
             "target_x": float(scaled_pos[0]),
             "target_y": float(scaled_pos[1]),
             "target_z": float(scaled_pos[2]),
-            "target_wx": float(scaled_rot[0]),
-            "target_wy": float(scaled_rot[1]),
-            "target_wz": float(scaled_rot[2]),
+            # TODO: just for safety purposes we disable rotation for now
+            "target_wx": float(scaled_rot[0]) * 0.0,
+            "target_wy": float(scaled_rot[1]) * 0.0,
+            "target_wz": float(scaled_rot[2]) * 0.0,
             "gripper_vel": gripper_vel,
             "omega.button_mask": button_mask,
         }

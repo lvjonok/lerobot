@@ -110,6 +110,8 @@ class TeleoperateConfig:
     teleop_time_s: float | None = None
     # Display all cameras on screen
     display_data: bool = False
+    # Allow starting devices without sending commands to the robot.
+    disable_robot_actions: bool = False
 
 
 def teleop_loop(
@@ -121,6 +123,7 @@ def teleop_loop(
     robot_observation_processor: RobotProcessorPipeline[RobotObservation, RobotObservation],
     display_data: bool = False,
     duration: float | None = None,
+    disable_robot_actions: bool = False,
 ):
     """
     This function continuously reads actions from a teleoperation device, processes them through optional
@@ -159,8 +162,13 @@ def teleop_loop(
         # Process action for robot through pipeline
         robot_action_to_send = robot_action_processor((teleop_action, obs))
 
-        # Send processed action to robot (robot_action_processor.to_output should return dict[str, Any])
-        _ = robot.send_action(robot_action_to_send)
+        print(f"robot sent action: {robot_action_to_send}")
+
+        if disable_robot_actions:
+            sent_action = robot_action_to_send
+        else:
+            # Send processed action to robot (robot_action_processor.to_output should return dict[str, Any])
+            sent_action = robot.send_action(robot_action_to_send)
 
         if display_data:
             # Process robot observation through pipeline
@@ -174,7 +182,7 @@ def teleop_loop(
             print("\n" + "-" * (display_len + 10))
             print(f"{'NAME':<{display_len}} | {'NORM':>7}")
             # Display the final robot action that was sent
-            for motor, value in robot_action_to_send.items():
+            for motor, value in sent_action.items():
                 print(f"{motor:<{display_len}} | {value:>7.2f}")
             move_cursor_up(len(robot_action_to_send) + 5)
 
@@ -211,6 +219,7 @@ def teleoperate(cfg: TeleoperateConfig):
             teleop_action_processor=teleop_action_processor,
             robot_action_processor=robot_action_processor,
             robot_observation_processor=robot_observation_processor,
+            disable_robot_actions=cfg.disable_robot_actions,
         )
     except KeyboardInterrupt:
         pass
