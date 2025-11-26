@@ -17,3 +17,9 @@
 from .config import TeleoperatorConfig
 from .teleoperator import Teleoperator
 from .utils import TeleopEvents, make_teleoperator_from_config
+
+# Register Omega teleoperators when available so their config types show up in the CLI.
+try:  # pragma: no cover - optional dependency
+    from .omega3 import ForceDimensionOmega, ForceDimensionOmegaConfig  # noqa: F401
+except ImportError:  # pragma: no cover - SDK not installed
+    pass

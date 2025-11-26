@@ -93,6 +93,12 @@ from lerobot.utils.robot_utils import busy_wait
 from lerobot.utils.utils import init_logging, move_cursor_up
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
+# Register developer mocks (if present) so `--robot.type=mock_robot` works without extra setup.
+try:  # pragma: no cover - optional convenience import for local development only
+    import tests.mocks.mock_robot  # noqa: F401
+except ImportError:  # pragma: no cover - tests package not shipped in production wheels
+    pass
+
 
 @dataclass
 class TeleoperateConfig:
