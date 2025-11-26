@@ -46,7 +46,7 @@ class ForceDimensionOmegaConfig(TeleoperatorConfig):
     device_type: str | int | None = None
 
     translation_scale: float = 1.0
-    rotation_scale: float = 1.0
+    rotation_scale: float = 0.2
     translation_deadband_m: float = 1e-4
     rotation_deadband_rad: float = 5e-3
 
@@ -56,6 +56,8 @@ class ForceDimensionOmegaConfig(TeleoperatorConfig):
     gripper_open_button_index: int | None = None
     gripper_close_button_index: int | None = None
     gripper_speed: float = 1.0
+    enable_keyboard_gripper: bool = False
+    keyboard_toggle_key: str = "space"
 
     def __post_init__(self) -> None:
         if self.device_index is not None and self.device_index < 0:
@@ -70,3 +72,6 @@ class ForceDimensionOmegaConfig(TeleoperatorConfig):
                 self.device_type = "OMEGA6_RIGHT"
             else:
                 self.device_type = "OMEGA3"
+
+        if self.enable_keyboard_gripper and not self.keyboard_toggle_key:
+            raise ValueError("keyboard_toggle_key must be a non-empty string when keyboard gripper is enabled.")

@@ -55,4 +55,14 @@ class URRobotConfig(RobotConfig):
     # TODO: set this to your desired 6D joint vector for automatic reset, or keep None to skip.
     home_joint_positions: tuple[float, ...] | None = None
 
+    # Schunk gripper IO configuration
+    gripper_ready_channel: int = 0
+    gripper_open_channel: int = 1
+    gripper_close_channel: int = 2
+    gripper_settle_time: float = 0.05
+    gripper_pulse_duration: float = 0.2
+
+    monitor_dashboard: bool = True
+    dashboard_retry_attempts: int = 3
+
     cameras: dict[str, CameraConfig] = field(default_factory=dict)

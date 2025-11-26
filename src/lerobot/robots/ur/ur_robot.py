@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -34,6 +34,8 @@ from .admittance import (
     tcp_pose_to_matrix,
 )
 from .config_ur import URRobotConfig
+from .dashboard import URDashboardHelper
+from .gripper import SchunkGripperController
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +64,9 @@ class URRobot(Robot):
         self._last_pose_command: np.ndarray | None = None
         self._last_enabled = False
         self._force_lowpass = np.zeros(6, dtype=float)
-        self._gripper_closed = True
+        self._gripper: SchunkGripperController | None = None
+        self._gripper_is_open = False
+        self._dashboard: URDashboardHelper | None = None
 
     @property
     def observation_features(self) -> dict:
@@ -123,7 +127,8 @@ class URRobot(Robot):
         if calibrate:
             self.calibrate()
         self.configure()
-        self._close_gripper()
+        self._init_gripper()
+        self._init_dashboard()
         self._reset_joints_if_requested()
         logger.info("Connected to UR robot at %s", self.config.robot_ip)
 
@@ -192,7 +197,7 @@ class URRobot(Robot):
         self._force_lowpass = (1.0 - alpha) * self._force_lowpass + alpha * force
         obs["observation.ee_force"] = self._force_lowpass.tolist()
 
-        obs["observation.gripper_position"] = [0.0 if self._gripper_closed else 1.0]
+        obs["observation.gripper_position"] = [1.0 if self._gripper_state() else 0.0]
 
         try:
             timestamp = float(recv.getTimestamp())
@@ -210,6 +215,9 @@ class URRobot(Robot):
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
         enabled = bool(action.get("enabled", True))
+        gripper_vel = float(action.get("gripper_vel", 0.0))
+        self._apply_gripper_velocity(gripper_vel)
+
         delta_pos = np.array(
             [
                 float(action.get("target_x", 0.0)),
@@ -245,11 +253,13 @@ class URRobot(Robot):
                 "target_wx": float(delta_rot[0]),
                 "target_wy": float(delta_rot[1]),
                 "target_wz": float(delta_rot[2]),
-                "gripper_vel": float(action.get("gripper_vel", 0.0)),
+                "gripper_vel": gripper_vel,
             }
 
         if not self._last_enabled or self._reference_pose is None:
             self._reference_pose = self._current_pose_quat()
+
+        self._ensure_dashboard_ready()
 
         assert self._reference_pose is not None
         ref_pos = self._reference_pose[:3]
@@ -269,7 +279,7 @@ class URRobot(Robot):
             "target_wx": float(delta_rot[0]),
             "target_wy": float(delta_rot[1]),
             "target_wz": float(delta_rot[2]),
-            "gripper_vel": float(action.get("gripper_vel", 0.0)),
+            "gripper_vel": gripper_vel,
         }
 
     def disconnect(self) -> None:
@@ -288,13 +298,106 @@ class URRobot(Robot):
         self._reference_pose = None
         self._last_pose_command = None
         self._last_enabled = False
+        self._gripper = None
+        if self._dashboard is not None:
+            self._dashboard.disconnect()
+            self._dashboard = None
         logger.info("Disconnected UR robot at %s", self.config.robot_ip)
 
-    def _close_gripper(self) -> None:
-        """Best-effort gripper close. TODO: wire actual gripper driver & teleop input."""
+    def _init_gripper(self) -> None:
+        assert self._rtde_receive is not None
+        self._gripper = SchunkGripperController(
+            self.config.robot_ip,
+            ready_channel=self.config.gripper_ready_channel,
+            open_channel=self.config.gripper_open_channel,
+            close_channel=self.config.gripper_close_channel,
+            settle_time=self.config.gripper_settle_time,
+            pulse_duration=self.config.gripper_pulse_duration,
+            receive_interface=self._rtde_receive,
+        )
+        try:
+            self._gripper.close()
+            self._gripper_is_open = False
+        except Exception as exc:  # pragma: no cover - hardware failure
+            logger.warning("Failed to home Schunk gripper: %s", exc)
 
-        self._gripper_closed = True
-        logger.info("Assuming UR gripper is closed (placeholder implementation).")
+    def _apply_gripper_velocity(self, gripper_vel: float) -> None:
+        """Drive the physical gripper when commanded by teleop."""
+
+        if self._gripper is None:
+            return
+
+        threshold = 1e-3
+        try:
+            if gripper_vel > threshold and not self._gripper_is_open:
+                self._gripper.open()
+                self._gripper_is_open = True
+                logger.info("Schunk gripper opened.")
+            elif gripper_vel < -threshold and self._gripper_is_open:
+                self._gripper.close()
+                self._gripper_is_open = False
+                logger.info("Schunk gripper closed.")
+        except Exception as exc:  # pragma: no cover - hardware failure
+            logger.warning("Failed to command Schunk gripper: %s", exc)
+
+    def _gripper_state(self) -> bool:
+        if self._gripper is None:
+            return self._gripper_is_open
+
+        try:
+            state = self._gripper.is_open()
+        except Exception as exc:  # pragma: no cover - hardware failure
+            logger.warning("Failed to read Schunk gripper state: %s", exc)
+            state = None
+
+        if state is not None:
+            self._gripper_is_open = bool(state)
+        return self._gripper_is_open
+
+    def _init_dashboard(self) -> None:
+        if not self.config.monitor_dashboard:
+            return
+        try:
+            self._dashboard = URDashboardHelper(self.config.robot_ip)
+        except ImportError as exc:
+            logger.warning("Dashboard monitoring disabled: %s", exc)
+            self._dashboard = None
+        except Exception as exc:  # pragma: no cover - dashboard unavailable
+            logger.warning("Failed to connect to UR dashboard: %s", exc)
+            self._dashboard = None
+
+    def _handle_dashboard_pause(self, info: dict[str, str]) -> None:
+        logger.warning(
+            "UR dashboard reported pause (robot mode=%s, safety mode=%s).",
+            info.get("robot_mode", "unknown"),
+            info.get("safety_mode", "unknown"),
+        )
+        if self._admittance_loop is not None and self._admittance_loop.is_running():
+            self._admittance_loop.stop()
+
+    def _ensure_dashboard_ready(self) -> None:
+        if self._dashboard is None:
+            return
+        self._dashboard.ensure_running(on_pause=self._handle_dashboard_pause)
+
+    def _run_with_dashboard_retry(self, func: Callable[[], Any]) -> Any:
+        attempts = 0
+        max_attempts = max(0, int(self.config.dashboard_retry_attempts))
+
+        while True:
+            try:
+                return func()
+            except Exception as exc:
+                attempts += 1
+                if self._dashboard is None or attempts > max_attempts:
+                    raise
+                logger.warning(
+                    "UR command failed (%s). Attempt %s/%s. Waiting for dashboard to resume.",
+                    exc,
+                    attempts,
+                    max_attempts,
+                )
+                self._dashboard.ensure_running(on_pause=self._handle_dashboard_pause)
 
     def _reset_joints_if_requested(self) -> None:
         if self.config.home_joint_positions is None:
@@ -308,12 +411,18 @@ class URRobot(Robot):
             raise DeviceNotConnectedError("Cannot reset joints before RTDE control is available.")
 
         logger.info("Resetting UR joints to configured home pose.")
-        try:
+
+        def _move_home():
+            self._ensure_dashboard_ready()
+            assert self._rtde_control is not None
             self._rtde_control.moveJ(
                 joints.tolist(),
                 float(self.config.servo_velocity),
                 float(self.config.servo_acceleration),
             )
+
+        try:
+            self._run_with_dashboard_retry(_move_home)
         except Exception as exc:  # pragma: no cover - hardware failure
             logger.warning("Failed to move to home joint positions: %s", exc)
 
@@ -372,7 +481,10 @@ class URRobot(Robot):
         dt = 1.0 / max(float(self.config.servo_frequency_hz), 1.0)
         rotvec = Rotation.from_quat(pose[3:]).as_rotvec()
         tcp_pose = np.concatenate([pose[:3], rotvec])
-        try:
+
+        def _servo():
+            self._ensure_dashboard_ready()
+            assert self._rtde_control is not None
             start_period = self._rtde_control.initPeriod()
             self._rtde_control.servoL(
                 tcp_pose.tolist(),
@@ -383,6 +495,9 @@ class URRobot(Robot):
                 float(self.config.servo_gain),
             )
             self._rtde_control.waitPeriod(start_period)
+
+        try:
+            self._run_with_dashboard_retry(_servo)
         except Exception as exc:  # pragma: no cover - hardware failure
             logger.warning("Failed to send servo command: %s", exc)
 

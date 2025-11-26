@@ -38,6 +38,11 @@ except ImportError as import_err:  # pragma: no cover - exercised when dependenc
 else:
     _IMPORT_ERROR = None
 
+try:  # pragma: no cover - optional dependency
+    from pynput import keyboard as pynput_keyboard
+except ImportError:
+    pynput_keyboard = None
+
 
 def _ensure_sdk_available() -> None:
     if _IMPORT_ERROR is not None:
@@ -74,6 +79,9 @@ class ForceDimensionOmega(Teleoperator):
         self._has_reference = False
         self._enabled = False
         self._last_button_mask = 0
+        self._keyboard_listener = None
+        self._keyboard_toggle_request = False
+        self._keyboard_gripper_open = False
 
     @property
     def action_features(self) -> dict[str, type]:
@@ -110,6 +118,8 @@ class ForceDimensionOmega(Teleoperator):
         # Disable force output for passive teleoperation.
         dhd.enableForce(False, self._device_id)
         logger.info("Connected to %s (id=%s, serial=%s)", self._device_label, self._device_id, self._serial_number())
+
+        self._start_keyboard_listener()
 
         if calibrate:
             self.calibrate()
@@ -205,6 +215,9 @@ class ForceDimensionOmega(Teleoperator):
             scaled_rot[:] = 0.0
 
         gripper_vel = self._compute_gripper_velocity(button_mask)
+        keyboard_velocity = self._consume_keyboard_toggle_velocity()
+        if keyboard_velocity is not None:
+            gripper_vel = keyboard_velocity
 
         action = {
             "enabled": enabled,
@@ -212,9 +225,9 @@ class ForceDimensionOmega(Teleoperator):
             "target_y": float(scaled_pos[1]),
             "target_z": float(scaled_pos[2]),
             # TODO: just for safety purposes we disable rotation for now
-            "target_wx": float(scaled_rot[0]) * 0.0,
-            "target_wy": float(scaled_rot[1]) * 0.0,
-            "target_wz": float(scaled_rot[2]) * 0.0,
+            "target_wx": float(scaled_rot[0]),
+            "target_wy": float(scaled_rot[1]),
+            "target_wz": float(scaled_rot[2]),
             "gripper_vel": gripper_vel,
             "omega.button_mask": button_mask,
         }
@@ -293,6 +306,7 @@ class ForceDimensionOmega(Teleoperator):
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
         dhd.close(self._device_id)
+        self._stop_keyboard_listener()
         logger.info("Disconnected %s (id=%s)", self._device_label, self._device_id)
         self._device_id = None
         self._enabled = False
@@ -317,3 +331,72 @@ class ForceDimensionOmega(Teleoperator):
         except Exception:  # pragma: no cover - defensive
             return "Unknown SDK error"
         return error_name
+
+    # ------------------------------------------------------------------
+    # Keyboard gripper helpers
+    # ------------------------------------------------------------------
+
+    def _start_keyboard_listener(self) -> None:
+        if not self.config.enable_keyboard_gripper:
+            return
+        if pynput_keyboard is None:
+            logger.warning(
+                "Keyboard gripper toggle requested but `pynput` is not installed; "
+                "install lerobot[gamepad] or lerobot[dev] to enable it."
+            )
+            return
+        if self._keyboard_listener is not None:
+            return
+
+        key = self._resolve_keyboard_toggle_key()
+
+        def on_press(event):
+            if self._keyboard_key_matches(event, key):
+                self._keyboard_toggle_request = True
+
+        listener = pynput_keyboard.Listener(on_press=on_press)
+        listener.start()
+        self._keyboard_listener = listener
+        logger.info(
+            "Keyboard gripper toggle enabled. Press '%s' to toggle gripper state.", self.config.keyboard_toggle_key
+        )
+
+    def _stop_keyboard_listener(self) -> None:
+        if self._keyboard_listener is not None:
+            self._keyboard_listener.stop()
+            self._keyboard_listener = None
+
+    def _resolve_keyboard_toggle_key(self):
+        key_name = (self.config.keyboard_toggle_key or "").strip().lower()
+        if not key_name:
+            raise ValueError("keyboard_toggle_key must be set when keyboard gripper is enabled.")
+
+        if len(key_name) == 1:
+            return key_name
+
+        if pynput_keyboard is None:
+            return key_name
+
+        if hasattr(pynput_keyboard.Key, key_name):
+            return getattr(pynput_keyboard.Key, key_name)
+
+        raise ValueError(f"Unknown keyboard key '{self.config.keyboard_toggle_key}'.")
+
+    def _keyboard_key_matches(self, event, target) -> bool:
+        if pynput_keyboard is None:
+            return False
+
+        if isinstance(target, str) and len(target) == 1:
+            char = getattr(event, "char", "")
+            return char.lower() == target
+
+        return event == target
+
+    def _consume_keyboard_toggle_velocity(self) -> float | None:
+        if not self.config.enable_keyboard_gripper or not self._keyboard_toggle_request:
+            return None
+
+        self._keyboard_toggle_request = False
+        self._keyboard_gripper_open = not self._keyboard_gripper_open
+        direction = 1.0 if self._keyboard_gripper_open else -1.0
+        return direction * float(self.config.gripper_speed)
