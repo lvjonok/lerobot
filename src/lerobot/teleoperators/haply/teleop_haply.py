@@ -62,10 +62,6 @@ class HaplyTeleop(Teleoperator):
         self.is_controlling = False  # Toggled by button 'b'
         self.initial_position: dict | None = None
         self.initial_orientation: dict | None = None
-        
-        # Robot state when control starts
-        self.robot_initial_position: dict | None = None
-        self.robot_current_position: dict | None = None
 
         # Button state tracking
         self.prev_button_b = False
@@ -95,10 +91,11 @@ class HaplyTeleop(Teleoperator):
 
     @property
     def feedback_features(self) -> dict:
+        # No feedback needed - we only output deltas from initial Haply position
         return {
             "dtype": "float32",
-            "shape": (3,),
-            "names": {"x": 0, "y": 1, "z": 2},
+            "shape": (0,),
+            "names": {},
         }
 
     def connect(self, calibrate: bool = False) -> None:
@@ -133,17 +130,13 @@ class HaplyTeleop(Teleoperator):
             self.is_controlling = not self.is_controlling
 
             if self.is_controlling:
-                # Start controlling - capture initial pose from both Haply and robot
+                # Start controlling - capture initial pose from Haply
                 self.initial_position = state["xyz"].copy()
                 self.initial_orientation = state["quat"].copy()
-                # Store robot's current position as the starting point
-                if self.robot_current_position is not None:
-                    self.robot_initial_position = self.robot_current_position.copy()
             else:
                 # Stop controlling - reset initial pose
                 self.initial_position = None
                 self.initial_orientation = None
-                self.robot_initial_position = None
 
         self.prev_button_b = current_button_b
 
@@ -158,30 +151,22 @@ class HaplyTeleop(Teleoperator):
     def get_action(self) -> dict[str, Any]:
         state = self.haply_device.get_state()
 
-        # Compute absolute target position = robot_initial_position + haply_delta
-        if self.is_controlling and self.initial_position is not None and self.robot_initial_position is not None:
+        buttons = self._update_buttons()
+
+        # Compute delta position from initial Haply position
+        if self.is_controlling and self.initial_position is not None:
             current_pos = state["xyz"]
             delta_x = current_pos["x"] - self.initial_position["x"]
             delta_y = current_pos["y"] - self.initial_position["y"]
             delta_z = current_pos["z"] - self.initial_position["z"]
-            
-            # Target = robot's starting position + delta from Haply
-            target_x = self.robot_initial_position["x"] + delta_x
-            target_y = self.robot_initial_position["y"] + delta_y
-            target_z = self.robot_initial_position["z"] + delta_z
         else:
-            # When not controlling, return current robot position or zeros
-            if self.robot_current_position is not None:
-                target_x = self.robot_current_position["x"]
-                target_y = self.robot_current_position["y"]
-                target_z = self.robot_current_position["z"]
-            else:
-                target_x = target_y = target_z = 0.0
+            # When not controlling, return zero deltas
+            delta_x = delta_y = delta_z = 0.0
 
         action_dict = {
-            "x": float(target_x),
-            "y": float(target_y),
-            "z": float(target_z),
+            "x": float(delta_x),
+            "y": float(delta_y),
+            "z": float(delta_z),
         }
 
         # Handle gripper with button 'a' using toggle logic
@@ -240,15 +225,7 @@ class HaplyTeleop(Teleoperator):
         pass
 
     def send_feedback(self, feedback: dict[str, Any]) -> None:
-        """Receive robot position feedback and optionally send haptic feedback to the device."""
-        # Store the robot's current position
-        if "x" in feedback and "y" in feedback and "z" in feedback:
-            self.robot_current_position = {
-                "x": float(feedback["x"]),
-                "y": float(feedback["y"]),
-                "z": float(feedback["z"]),
-            }
-        # Can be extended later for force feedback to the Haply device
+        pass
 
     def _start_keyboard_listener(self) -> None:
         """Start listening for keyboard events."""

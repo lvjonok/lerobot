@@ -1,0 +1,23 @@
+# Configuration for slim-crisp-zmq robot
+# Use with: lerobot-record --robot slim_crisp.yaml --teleop haply.yaml
+
+type: slim_crisp
+id: slim_crisp_robot
+
+# ZMQ Server connection
+server_ip: "127.0.0.1"
+state_pub_port: 5556
+cmd_rep_port: 5557
+
+# ZMQ Client settings
+command_timeout: 5.0
+max_state_delay: 1.0
+
+# Controller settings
+default_controller: "cartesian_impedance_controller"
+
+# Gripper (TODO: implement gripper support)
+use_gripper: true
+
+# No cameras for now
+cameras: {}

@@ -357,6 +357,7 @@ def record_loop(
             robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
 
         # Send action to robot
+        print(f"Want to send action: {robot_action_to_send}")
         # Action can eventually be clipped using `max_relative_target`,
         # so action actually sent is saved in the dataset. action = postprocessor.process(action)
         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.

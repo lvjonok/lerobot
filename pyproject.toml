@@ -113,6 +113,7 @@ unitree_g1 = [
 ]
 reachy2 = ["reachy2_sdk>=1.0.14,<1.1.0"]
 kinematics = ["lerobot[placo-dep]"]
+slim_crisp = ["slim-crisp-zmq @ file:///home/lev/github.com/lvjonok/slim-crisp-zmq"]
 intelrealsense = [
     "pyrealsense2>=2.55.1.6486,<2.57.0 ; sys_platform != 'darwin'",
     "pyrealsense2-macosx>=2.54,<2.55.0 ; sys_platform == 'darwin'",
