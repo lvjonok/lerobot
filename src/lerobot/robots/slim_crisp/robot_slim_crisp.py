@@ -52,11 +52,15 @@ class SlimCrispRobot(Robot):
 
     @cached_property
     def observation_features(self) -> dict[str, type]:
-        """Define observation structure: Cartesian position + gripper state."""
+        """Define observation structure: Cartesian position + orientation + gripper state."""
         features = {
             "ee_pos_x": float,
             "ee_pos_y": float,
             "ee_pos_z": float,
+            "ee_quat_x": float,
+            "ee_quat_y": float,
+            "ee_quat_z": float,
+            "ee_quat_w": float,
         }
 
         if self.config.use_gripper:
@@ -67,11 +71,15 @@ class SlimCrispRobot(Robot):
 
     @cached_property
     def action_features(self) -> dict[str, type]:
-        """Define action structure: matches observation for Cartesian control."""
+        """Define action structure: matches observation for Cartesian control with orientation."""
         features = {
             "ee_pos_x": float,
             "ee_pos_y": float,
             "ee_pos_z": float,
+            "ee_quat_x": float,
+            "ee_quat_y": float,
+            "ee_quat_z": float,
+            "ee_quat_w": float,
         }
 
         if self.config.use_gripper:
@@ -193,10 +201,17 @@ class SlimCrispRobot(Robot):
         # Get end-effector pose
         ee_pose = self._robot.end_effector_pose
 
+        # Extract position and quaternion [x, y, z, w] from scipy Rotation
+        quat_xyzw = ee_pose.rotation.as_quat()  # Returns [x, y, z, w]
+
         obs = {
             "ee_pos_x": float(ee_pose.position[0]),
             "ee_pos_y": float(ee_pose.position[1]),
             "ee_pos_z": float(ee_pose.position[2]),
+            "ee_quat_x": float(quat_xyzw[0]),
+            "ee_quat_y": float(quat_xyzw[1]),
+            "ee_quat_z": float(quat_xyzw[2]),
+            "ee_quat_w": float(quat_xyzw[3]),
         }
 
         # Get gripper state if enabled
@@ -214,7 +229,9 @@ class SlimCrispRobot(Robot):
 
         Args:
             action: Dictionary with target end-effector position
-                   (ee_pos_x, ee_pos_y, ee_pos_z) and optionally gripper.pos
+                   (ee_pos_x, ee_pos_y, ee_pos_z), orientation
+                   (ee_quat_x, ee_quat_y, ee_quat_z, ee_quat_w),
+                   and optionally gripper.pos
 
         Returns:
             The action that was sent (potentially modified for safety)
@@ -222,16 +239,30 @@ class SlimCrispRobot(Robot):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        # Extract Cartesian target position
+        # Extract target position and orientation from action
         target_position = [
             action["ee_pos_x"],
             action["ee_pos_y"],
             action["ee_pos_z"],
         ]
 
-        # Send Cartesian target to robot (non-blocking)
-        # NOTE: don't really allow to send action yet
-        self._robot.set_target(position=target_position)
+        # Extract quaternion [x, y, z, w] for scipy Rotation
+        quat_xyzw = [
+            action.get("ee_quat_x", 0.0),
+            action.get("ee_quat_y", 0.0),
+            action.get("ee_quat_z", 0.0),
+            action.get("ee_quat_w", 1.0),  # Default to identity quaternion
+        ]
+
+        # Import Pose and Rotation here to build target pose
+        from scipy.spatial.transform import Rotation
+        from client import Pose
+
+        target_rotation = Rotation.from_quat(quat_xyzw)
+        target_pose = Pose(target_position, target_rotation)
+
+        # Send target pose to robot (non-blocking)
+        self._robot.set_target(pose=target_pose)
 
         # Handle gripper if enabled
         if self.config.use_gripper and self._gripper is not None and "gripper.pos" in action:

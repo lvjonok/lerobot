@@ -72,14 +72,14 @@ class HaplyTeleop(Teleoperator):
         if self.config.use_gripper:
             return {
                 "dtype": "float32",
-                "shape": (4,),
-                "names": {"x": 0, "y": 1, "z": 2, "gripper": 3},
+                "shape": (8,),
+                "names": {"x": 0, "y": 1, "z": 2, "qw": 3, "qx": 4, "qy": 5, "qz": 6, "gripper": 7},
             }
         else:
             return {
                 "dtype": "float32",
-                "shape": (3,),
-                "names": {"x": 0, "y": 1, "z": 2},
+                "shape": (7,),
+                "names": {"x": 0, "y": 1, "z": 2, "qw": 3, "qx": 4, "qy": 5, "qz": 6},
             }
 
     @property
@@ -130,13 +130,18 @@ class HaplyTeleop(Teleoperator):
         state = self.haply_device.get_state()
         buttons = self._update_buttons()
 
-        # Output RAW position from Haply (processor will handle clutching and deltas)
+        # Output RAW position and orientation from Haply (processor will handle clutching and deltas)
         current_pos = state["xyz"]
+        current_quat = state["quat"]  # Get raw orientation
 
         action_dict = {
             "x": float(current_pos["x"]),
             "y": float(current_pos["y"]),
             "z": float(current_pos["z"]),
+            "qw": float(current_quat["w"]),
+            "qx": float(current_quat["x"]),
+            "qy": float(current_quat["y"]),
+            "qz": float(current_quat["z"]),
             "is_controlling": buttons.get("b", False),  # Raw button state
         }
 

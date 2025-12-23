@@ -205,11 +205,21 @@ def teleoperate(cfg: TeleoperateConfig):
 
     # Use specialized clutch processor for Haply + SlimCrisp
     if cfg.teleop.type == "haply" and cfg.robot.type == "slim_crisp":
-        logging.info("Using HaplyToSlimCrispClutchProcessor for cumulative clutching")
+        from scipy.spatial.transform import Rotation
+        import numpy as np
+
+        # Orientation frame transform
+        frame_transform = Rotation.from_matrix(
+            np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
+        )
+
         teleop_action_processor = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
             steps=[
                 HaplyToSlimCrispClutchProcessor(
-                    axis_scales=[-1.0, -1.0, 1.0],  # Invert X and Y axes
+                    axis_scales=[-1.0, -1.0, 1.0],
+                    enable_orientation=True,
+                    rotation_deadband=0.01,
+                    orientation_frame_transform=frame_transform.as_quat().tolist(),
                 )
             ],
             to_transition=robot_action_observation_to_transition,
