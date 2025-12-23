@@ -49,6 +49,7 @@ class SlimCrispRobot(Robot):
         self._robot = None
         self._gripper = None
         self._is_connected = False
+        self._last_gripper_target = None  # Track last sent gripper value
 
     @cached_property
     def observation_features(self) -> dict[str, type]:
@@ -264,13 +265,14 @@ class SlimCrispRobot(Robot):
         # Send target pose to robot (non-blocking)
         self._robot.set_target(pose=target_pose)
 
-        # Handle gripper if enabled
+        # Handle gripper if enabled - only send if value changed
         if self.config.use_gripper and self._gripper is not None and "gripper.pos" in action:
-            # TODO(lvjonok): Implement actual gripper action
-            # For now, just log the gripper target
-            gripper_target = action["gripper.pos"]
-            # self._gripper.set_target(float(gripper_target))
-            logger.debug(f"Gripper target: {gripper_target} (not implemented)")
+            gripper_target = float(action["gripper.pos"])
+            # Only send command if value changed
+            if self._last_gripper_target is None or abs(gripper_target - self._last_gripper_target) > 1e-6:
+                self._gripper.set_target(gripper_target)
+                logger.debug(f"Gripper target set to: {gripper_target}")
+                self._last_gripper_target = gripper_target
 
         # Return the action that was sent
         return action

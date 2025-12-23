@@ -340,9 +340,15 @@ class HaplyToSlimCrispClutchProcessor(RobotActionProcessorStep):
             robot_action[self.robot_rotation_keys[2]] = float(target_quat_wxyz[2])  # y
             robot_action[self.robot_rotation_keys[3]] = float(target_quat_wxyz[3])  # z
 
-        # Pass through gripper (no transformation needed)
+        # Map discrete gripper action to continuous [0-1]
+        # Haply: CLOSE=0, STAY=1, OPEN=2 -> Robot: 0.0=closed, 1.0=open
         if self.teleop_gripper_key in action:
-            robot_action[self.robot_gripper_key] = action[self.teleop_gripper_key]
+            discrete_gripper = action[self.teleop_gripper_key]
+            if discrete_gripper == 0:  # CLOSE
+                robot_action[self.robot_gripper_key] = 0.0
+            elif discrete_gripper == 2:  # OPEN
+                robot_action[self.robot_gripper_key] = 1.0
+            # STAY (1) is ignored - maintains last commanded state
 
         return robot_action
 

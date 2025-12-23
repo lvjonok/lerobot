@@ -118,7 +118,7 @@ class HaplyTeleop(Teleoperator):
         buttons = state["buttons"]
 
         # Toggle gripper state with button 'a'
-        current_button_a = buttons.get(0, False)
+        current_button_a = buttons.get('a', False)
         if current_button_a and not self.prev_button_a:
             self.gripper_closed = not self.gripper_closed
         self.prev_button_a = current_button_a
