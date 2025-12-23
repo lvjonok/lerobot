@@ -40,6 +40,7 @@ from .gym_action_processor import (
     Numpy2TorchActionProcessorStep,
     Torch2NumpyActionProcessorStep,
 )
+from .haply_clutch_processor import HaplyToSlimCrispClutchProcessor
 from .hil_processor import (
     AddTeleopActionAsComplimentaryDataStep,
     AddTeleopEventsAsInfoStep,
@@ -89,6 +90,7 @@ __all__ = [
     "EnvAction",
     "EnvTransition",
     "GripperPenaltyProcessorStep",
+    "HaplyToSlimCrispClutchProcessor",
     "hotswap_stats",
     "IdentityProcessorStep",
     "ImageCropResizeProcessorStep",

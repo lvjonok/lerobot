@@ -58,15 +58,8 @@ class HaplyTeleop(Teleoperator):
         self.haply_device = None
         self.keyboard_listener = None
 
-        # Control state
-        self.is_controlling = False  # Toggled by button 'b'
-        self.initial_position: dict | None = None
-        self.initial_orientation: dict | None = None
-
-        # Button state tracking
-        self.prev_button_b = False
+        # Button state tracking for gripper toggle
         self.prev_button_a = False
-        self.prev_button_c = False
 
         # Gripper state (toggled by button 'a')
         self.gripper_closed = False
@@ -91,7 +84,7 @@ class HaplyTeleop(Teleoperator):
 
     @property
     def feedback_features(self) -> dict:
-        # No feedback needed - we only output deltas from initial Haply position
+        # No feedback needed - we output raw Haply positions
         return {
             "dtype": "float32",
             "shape": (0,),
@@ -120,27 +113,11 @@ class HaplyTeleop(Teleoperator):
         return self.haply_device is not None and self.haply_device.running
 
     def _update_buttons(self) -> dict[str, bool]:
-        # all the logic handling buttons
+        """Update button states and handle gripper toggle."""
         state = self.haply_device.get_state()
         buttons = state["buttons"]
 
-        # toggle of active control with button 'b'
-        current_button_b = buttons.get('b', False)
-        if current_button_b and not self.prev_button_b:
-            self.is_controlling = not self.is_controlling
-
-            if self.is_controlling:
-                # Start controlling - capture initial pose from Haply
-                self.initial_position = state["xyz"].copy()
-                self.initial_orientation = state["quat"].copy()
-            else:
-                # Stop controlling - reset initial pose
-                self.initial_position = None
-                self.initial_orientation = None
-
-        self.prev_button_b = current_button_b
-
-        # toggle of gripper state with button 'a'
+        # Toggle gripper state with button 'a'
         current_button_a = buttons.get(0, False)
         if current_button_a and not self.prev_button_a:
             self.gripper_closed = not self.gripper_closed
@@ -149,24 +126,18 @@ class HaplyTeleop(Teleoperator):
         return buttons
 
     def get_action(self) -> dict[str, Any]:
+        """Get raw Haply state and button values."""
         state = self.haply_device.get_state()
-
         buttons = self._update_buttons()
 
-        # Compute delta position from initial Haply position
-        if self.is_controlling and self.initial_position is not None:
-            current_pos = state["xyz"]
-            delta_x = current_pos["x"] - self.initial_position["x"]
-            delta_y = current_pos["y"] - self.initial_position["y"]
-            delta_z = current_pos["z"] - self.initial_position["z"]
-        else:
-            # When not controlling, return zero deltas
-            delta_x = delta_y = delta_z = 0.0
+        # Output RAW position from Haply (processor will handle clutching and deltas)
+        current_pos = state["xyz"]
 
         action_dict = {
-            "x": float(delta_x),
-            "y": float(delta_y),
-            "z": float(delta_z),
+            "x": float(current_pos["x"]),
+            "y": float(current_pos["y"]),
+            "z": float(current_pos["z"]),
+            "is_controlling": buttons.get("b", False),  # Raw button state
         }
 
         # Handle gripper with button 'a' using toggle logic
@@ -189,18 +160,19 @@ class HaplyTeleop(Teleoperator):
 
         buttons = self._update_buttons()
 
+        # Button 'b' indicates intervention (held to control)
+        is_intervention = buttons.get("b", False)
         success = buttons.get("c", False)
         rerecord_episode = self.rerecord_requested
 
-        # Keyboard 'R' for rerecord
-        # rerecord_episode = self.rerecord_requested
-        self.rerecord_requested = False  # Reset after reading
+        # Reset rerecord flag after reading
+        self.rerecord_requested = False
 
         # Terminate episode if success or rerecord requested
         terminate_episode = success or rerecord_episode
 
         return {
-            TeleopEvents.IS_INTERVENTION.value: self.is_controlling,
+            TeleopEvents.IS_INTERVENTION.value: is_intervention,
             TeleopEvents.TERMINATE_EPISODE.value: terminate_episode,
             TeleopEvents.SUCCESS.value: success,
             TeleopEvents.RERECORD_EPISODE.value: rerecord_episode,
@@ -252,15 +224,10 @@ class HaplyTeleop(Teleoperator):
             self.keyboard_listener.stop()
             self.keyboard_listener = None
 
-    def get_orientation_delta(self) -> Optional[dict]:
-        """Get the orientation delta as quaternion difference."""
-        if not self.is_controlling or self.initial_orientation is None:
+    def get_orientation(self) -> Optional[dict]:
+        """Get the raw orientation as quaternion."""
+        if self.haply_device is None:
             return None
 
         state = self.haply_device.get_state()
-        current_quat = state["quat"]
-
-        return {
-            "initial": self.initial_orientation.copy(),
-            "current": current_quat.copy(),
-        }
+        return state["quat"].copy()
