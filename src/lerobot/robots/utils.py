@@ -68,6 +68,10 @@ def make_robot_from_config(config: RobotConfig) -> Robot:
         from .crisp_fastapi import CrispFastAPIRobot
 
         return CrispFastAPIRobot(config)
+    elif config.type == "crisp_ws":
+        from .crisp_ws import CrispWSRobot
+
+        return CrispWSRobot(config)
     elif config.type == "mock_robot":
         from tests.mocks.mock_robot import MockRobot
 

@@ -192,7 +192,7 @@ class CrispFastAPIRobot(Robot):
         return obs
 
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
-        """Send action command to the robot."""
+        """Send action command to the robot via a single combined request."""
         if not self._connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
@@ -202,29 +202,20 @@ class CrispFastAPIRobot(Robot):
 
         target_tcp = np.concatenate([tcp_pos, tcp_quat]).tolist()
 
-        def _send_tcp():
-            try:
-                r = self._client.post(
-                    "/move_tcp/left",
-                    json={"target_tcp": target_tcp, "feedforward_wrench": None},
-                )
-                r.raise_for_status()
-            except Exception as e:
-                logger.error(f"Failed to send TCP command: {e}")
-
-        def _send_gripper():
-            try:
-                r = self._client.post(
-                    "/move_gripper/left",
-                    json={
-                        "width": gripper_pos,
-                        "velocity": self.config.gripper_velocity,
-                        "force_limit": self.config.gripper_force,
-                    },
-                )
-                r.raise_for_status()
-            except Exception as e:
-                logger.error(f"Failed to send gripper command: {e}")
+        try:
+            r = self._client.post(
+                "/send_action/left",
+                json={
+                    "target_tcp": target_tcp,
+                    "gripper_width": gripper_pos,
+                    "gripper_velocity": self.config.gripper_velocity,
+                    "gripper_force": self.config.gripper_force,
+                    "feedforward_wrench": None,
+                },
+            )
+            r.raise_for_status()
+        except Exception as e:
+            logger.error(f"Failed to send action: {e}")
 
         f_tcp = self._pool.submit(_send_tcp)
         f_grip = self._pool.submit(_send_gripper)
