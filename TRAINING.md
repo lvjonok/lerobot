@@ -401,3 +401,155 @@ accelerate launch -m lerobot.scripts.lerobot_train \
 ```
 
 Mixed precision is handled automatically via `accelerator.autocast()`.
+
+---
+
+# Training Reactive Diffusion Policy (RDP) with LeRobot
+
+This guide covers training the two-stage Reactive Diffusion Policy (Xue et al., RSS 2025) using the LeRobot framework.
+
+## Overview
+
+RDP consists of two stages trained sequentially:
+
+1. **Asymmetric Tokenizer (AT)** (`rdp_tokenizer`) — a VAE/VQ-VAE that compresses action chunks into a low-dimensional latent space. The encoder is simple (MLP or Conv1D); the decoder is optionally an RNN conditioned on temporal observations (e.g. tactile/force data).
+2. **Latent Diffusion Policy (LDP)** (`rdp_latent_diffusion`) — a conditional 1-D UNet diffusion model that operates in the latent action space of the frozen AT. It uses the same vision encoder architecture as the standard Diffusion Policy.
+
+## Stage 1: Train the Asymmetric Tokenizer
+
+The AT learns to encode and decode action trajectories. It does not use image observations.
+
+```bash
+lerobot-train \
+  --policy.type=rdp_tokenizer \
+  --dataset.repo_id=<user>/<dataset> \
+  --policy.horizon=32 \
+  --policy.encoder_type=conv1d \
+  --policy.decoder_type=rnn \
+  --policy.temporal_cond_keys='("observation.wrench",)'
+```
+
+### Key configuration options
+
+| Parameter | Default | Description |
+|---|---|---|
+| `horizon` | 32 | Length of the action chunk to encode/decode |
+| `encoder_type` | `"mlp"` | Encoder architecture: `"mlp"` or `"conv1d"` |
+| `n_latent_dims` | 4 | Dimensionality of the latent code |
+| `encoder_hidden_dim` | 32 | Hidden dimension for encoder layers |
+| `decoder_type` | `"mlp"` | Decoder architecture: `"mlp"` or `"rnn"` |
+| `decoder_hidden_dim` | 32 | Hidden dimension for decoder layers |
+| `use_vq` | `False` | Use Residual VQ instead of Gaussian VAE |
+| `n_embed` | 32 | Codebook size (VQ) or quant channel dim (VAE) |
+| `temporal_cond_keys` | `()` | Observation keys for RNN temporal conditioning (required when `decoder_type="rnn"`) |
+| `kl_multiplier` | 1e-6 | KL divergence loss weight (Gaussian VAE mode) |
+| `vq_loss_multiplier` | 5.0 | VQ commitment loss weight (VQ mode) |
+| `act_scale` | 1.0 | Divisor applied to normalised actions before encoding |
+
+### Encoder types
+
+- **`mlp`**: Flattens the action chunk and processes with an MLP. Latent is a single vector.
+- **`conv1d`**: Uses 1-D convolutions with stride-2 downsampling. Latent is a sequence shorter than the input, which the LDP diffuses over as a 1-D trajectory.
+
+### Decoder types
+
+- **`mlp`**: Standard MLP decoder. No temporal conditioning.
+- **`rnn`**: GRU-based decoder with temporal conditioning. Requires `temporal_cond_keys` to specify which observation features to use as step-by-step conditioning (e.g. force/torque readings, tactile data). This is the "asymmetric" part — the decoder has access to per-step observations that the encoder does not.
+
+### Training output
+
+The trained AT checkpoint will be saved to the standard LeRobot output directory. Note the path — you will need it for Stage 2.
+
+## Stage 2: Train the Latent Diffusion Policy
+
+The LDP requires a pre-trained AT checkpoint from Stage 1.
+
+```bash
+lerobot-train \
+  --policy.type=rdp_latent_diffusion \
+  --dataset.repo_id=<user>/<dataset> \
+  --policy.pretrained_tokenizer_path=<path_to_at_checkpoint> \
+  --policy.horizon=32 \
+  --policy.at_encoder_type=conv1d \
+  --policy.at_decoder_type=rnn \
+  --policy.at_temporal_cond_keys='("observation.wrench",)'
+```
+
+### Key configuration options
+
+| Parameter | Default | Description |
+|---|---|---|
+| `pretrained_tokenizer_path` | `None` | Path to trained AT checkpoint (required) |
+| `use_latent_action_before_vq` | `False` | Diffuse on pre-quantisation latent (only relevant when AT uses VQ) |
+| `vision_backbone` | `"resnet18"` | Vision encoder backbone |
+| `crop_shape` | `(84, 84)` | Random crop size for image augmentation |
+| `down_dims` | `(512, 1024, 2048)` | UNet channel dimensions |
+| `noise_scheduler_type` | `"DDIM"` | Noise scheduler: `"DDIM"` or `"DDPM"` |
+| `num_train_timesteps` | 100 | Number of diffusion timesteps |
+| `num_inference_steps` | `None` | Inference steps (defaults to `num_train_timesteps`) |
+| `prediction_type` | `"epsilon"` | What the UNet predicts: `"epsilon"` or `"sample"` |
+
+### AT architecture parameters
+
+The LDP config duplicates the AT architecture parameters with an `at_` prefix so that the AT can be reconstructed at load time without the original config:
+
+| Parameter | Default | Mirrors AT |
+|---|---|---|
+| `at_encoder_type` | `"conv1d"` | `encoder_type` |
+| `at_n_latent_dims` | 4 | `n_latent_dims` |
+| `at_encoder_hidden_dim` | 32 | `encoder_hidden_dim` |
+| `at_encoder_n_layers` | 1 | `encoder_n_layers` |
+| `at_decoder_type` | `"rnn"` | `decoder_type` |
+| `at_decoder_hidden_dim` | 32 | `decoder_hidden_dim` |
+| `at_decoder_n_layers` | 1 | `decoder_n_layers` |
+| `at_use_vq` | `False` | `use_vq` |
+| `at_n_embed` | 32 | `n_embed` |
+| `at_vqvae_groups` | 4 | `vqvae_groups` |
+| `at_act_scale` | 1.0 | `act_scale` |
+| `at_temporal_cond_keys` | `()` | `temporal_cond_keys` |
+
+These **must match** the values used when training the AT in Stage 1.
+
+### What happens during training
+
+1. Actions from the dataset are encoded to latent space using the frozen AT encoder + quantization.
+2. The UNet learns to denoise these latent actions, conditioned on image and state observations.
+3. The AT is never updated — only the vision encoder and UNet are trained.
+
+### What happens during inference
+
+1. The vision encoder + UNet produce a denoised latent action.
+2. The frozen AT decoder converts the latent back to the original action space.
+3. If the AT uses an RNN decoder, temporal conditioning from the current observations is used during decoding.
+
+## Complete two-stage example
+
+```bash
+# Stage 1: Train the Asymmetric Tokenizer
+lerobot-train \
+  --policy.type=rdp_tokenizer \
+  --dataset.repo_id=domrachev03/franka_peg_insertion \
+  --policy.horizon=32 \
+  --policy.encoder_type=conv1d \
+  --policy.decoder_type=rnn \
+  --policy.temporal_cond_keys='("observation.wrench",)' \
+  --policy.n_latent_dims=4
+
+# Stage 2: Train the Latent Diffusion Policy (point to Stage 1 output)
+lerobot-train \
+  --policy.type=rdp_latent_diffusion \
+  --dataset.repo_id=domrachev03/franka_peg_insertion \
+  --policy.pretrained_tokenizer_path=outputs/<stage1_run>/pretrained_model \
+  --policy.at_encoder_type=conv1d \
+  --policy.at_decoder_type=rnn \
+  --policy.at_temporal_cond_keys='("observation.wrench",)' \
+  --policy.at_n_latent_dims=4 \
+  --policy.vision_backbone=resnet18 \
+  --policy.num_train_timesteps=100
+```
+
+## Reference
+
+- **Paper**: Xue et al., "Reactive Diffusion Policy", RSS 2025
+- **Original implementation**: `reactive_diffusion_policy/` (Hydra-based training pipeline)
+- **LeRobot port**: `lerobot/policies/rdp_tokenizer/` and `lerobot/policies/rdp_latent_diffusion/`
