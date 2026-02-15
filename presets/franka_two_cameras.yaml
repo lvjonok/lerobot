@@ -1,0 +1,58 @@
+# Hardware preset: Franka single arm with two RealSense cameras
+#
+# Cameras:
+#   - external_camera: D435i (serial 838212074376) — fixed external view
+#   - left_wrist_camera: D405 (serial 130322271369) — wrist-mounted
+#
+# Usage with lerobot-record:
+#   python record.py --preset franka_two_cameras --teleop spacemouse \
+#       --repo_id local/my_dataset --task "Pick and place"
+
+robot:
+  type: crisp_fastapi
+  server_url: "http://192.168.50.67:8092"
+  max_gripper_width: 0.078
+  gripper_velocity: 0.15
+  gripper_force: 20.0
+  cameras:
+    external_camera:
+      type: intelrealsense
+      serial_number_or_name: "838212074376"
+      fps: 30
+      width: 640
+      height: 480
+    left_wrist_camera:
+      type: intelrealsense
+      serial_number_or_name: "130322271369"
+      fps: 30
+      width: 640
+      height: 480
+
+# Default teleop settings (can be overridden on CLI)
+teleop_defaults:
+  spacemouse:
+    type: spacemouse
+    translation_scale: 0.0000125
+    rotation_scale: 0.000025
+    teleop_mode: "left_arm_3D_translation_Z_rotation"
+    translation_deadzone: 120.0
+    rotation_deadzone: 120.0
+  haply:
+    type: haply
+    ws_uri: "ws://localhost:10001"
+    translation_scale: 1.0
+    rotation_scale: 1.0
+    teleop_mode: "left_arm_3D_translation_Z_rotation"
+  meta_quest:
+    type: meta_quest
+    multicast_group: "224.1.1.1"
+    control_hand: "right"
+    translation_scale: 1.0
+    teleop_mode: "left_arm_3D_translation_Z_rotation"
+
+# Default dataset settings
+dataset_defaults:
+  fps: 30
+  episode_time_s: 60
+  num_episodes: 10
+  video: true

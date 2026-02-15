@@ -35,11 +35,13 @@ from .factory import (
     make_default_robot_action_processor,
     make_default_robot_observation_processor,
     make_default_teleop_action_processor,
+    make_processors_for,
 )
 from .gym_action_processor import (
     Numpy2TorchActionProcessorStep,
     Torch2NumpyActionProcessorStep,
 )
+from .crisp_fastapi_processors import HaplyToCrispClutchProcessor
 from .haply_clutch_processor import HaplyToSlimCrispClutchProcessor
 from .hil_processor import (
     AddTeleopActionAsComplimentaryDataStep,
@@ -90,6 +92,7 @@ __all__ = [
     "EnvAction",
     "EnvTransition",
     "GripperPenaltyProcessorStep",
+    "HaplyToCrispClutchProcessor",
     "HaplyToSlimCrispClutchProcessor",
     "hotswap_stats",
     "IdentityProcessorStep",
@@ -101,6 +104,7 @@ __all__ = [
     "make_default_teleop_action_processor",
     "make_default_robot_action_processor",
     "make_default_robot_observation_processor",
+    "make_processors_for",
     "MapDeltaActionToRobotActionStep",
     "MapTensorToDeltaActionDictStep",
     "MotorCurrentProcessorStep",

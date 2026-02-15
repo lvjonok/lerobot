@@ -81,6 +81,14 @@ def make_teleoperator_from_config(config: TeleoperatorConfig) -> Teleoperator:
         from .reachy2_teleoperator import Reachy2Teleoperator
 
         return Reachy2Teleoperator(config)
+    elif config.type == "spacemouse":
+        from .spacemouse import SpaceMouseTeleop
+
+        return SpaceMouseTeleop(config)
+    elif config.type == "meta_quest":
+        from .meta_quest import MetaQuestTeleop
+
+        return MetaQuestTeleop(config)
     else:
         try:
             return cast(Teleoperator, make_device_from_device_class(config))

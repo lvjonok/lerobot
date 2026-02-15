@@ -62,20 +62,16 @@ from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # no
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.configs import parser
 from lerobot.processor import (
-    HaplyToSlimCrispClutchProcessor,
     RobotAction,
     RobotObservation,
     RobotProcessorPipeline,
-    make_default_processors,
-)
-from lerobot.processor.converters import (
-    robot_action_observation_to_transition,
-    transition_to_robot_action,
+    make_processors_for,
 )
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
     bi_so100_follower,
+    crisp_fastapi,
     earthrover_mini_plus,
     hope_jr,
     koch_follower,
@@ -90,14 +86,16 @@ from lerobot.teleoperators import (  # noqa: F401
     TeleoperatorConfig,
     bi_so100_leader,
     gamepad,
+    haply,
     homunculus,
     keyboard,
     koch_leader,
     make_teleoperator_from_config,
+    meta_quest,
     omx_leader,
     so100_leader,
     so101_leader,
-    haply,
+    spacemouse,
 )
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.robot_utils import precise_sleep
@@ -203,33 +201,11 @@ def teleoperate(cfg: TeleoperateConfig):
     teleop = make_teleoperator_from_config(cfg.teleop)
     robot = make_robot_from_config(cfg.robot)
 
-    # Use specialized clutch processor for Haply + SlimCrisp
-    if cfg.teleop.type == "haply" and cfg.robot.type == "slim_crisp":
-        from scipy.spatial.transform import Rotation
-        import numpy as np
-
-        # Orientation frame transform
-        frame_transform = Rotation.from_matrix(
-            np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
-        )
-
-        teleop_action_processor = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
-            steps=[
-                HaplyToSlimCrispClutchProcessor(
-                    axis_scales=[-1.0, -1.0, 1.0],
-                    enable_orientation=True,
-                    rotation_deadband=0.01,
-                    orientation_frame_transform=frame_transform.as_quat().tolist(),
-                )
-            ],
-            to_transition=robot_action_observation_to_transition,
-            to_output=transition_to_robot_action,
-        )
-        _, robot_action_processor, robot_observation_processor = make_default_processors()
-    else:
-        teleop_action_processor, robot_action_processor, robot_observation_processor = (
-            make_default_processors()
-        )
+    # Select processor pipeline based on robot-teleop combination
+    teleop_action_processor, robot_action_processor, robot_observation_processor = make_processors_for(
+        robot_type=cfg.robot.type,
+        teleop_config=cfg.teleop,
+    )
 
     teleop.connect()
     robot.connect()
@@ -256,6 +232,9 @@ def teleoperate(cfg: TeleoperateConfig):
         if robot.name == "slim_crisp":
             logging.info("Moving robot to home position")
             robot._robot.home()
+        elif robot.name == "crisp_fastapi":
+            logging.info("Moving robot to home position")
+            robot.go_home()
 
         robot.disconnect()
 

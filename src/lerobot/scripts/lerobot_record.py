@@ -86,13 +86,14 @@ from lerobot.processor import (
     RobotAction,
     RobotObservation,
     RobotProcessorPipeline,
-    make_default_processors,
+    make_processors_for,
 )
 from lerobot.processor.rename_processor import rename_stats
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
     bi_so100_follower,
+    crisp_fastapi,
     earthrover_mini_plus,
     hope_jr,
     koch_follower,
@@ -105,12 +106,15 @@ from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
     bi_so100_leader,
+    haply,
     homunculus,
     koch_leader,
     make_teleoperator_from_config,
+    meta_quest,
     omx_leader,
     so100_leader,
     so101_leader,
+    spacemouse,
 )
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
@@ -388,7 +392,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     robot = make_robot_from_config(cfg.robot)
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
 
-    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+    # Select processor pipeline based on robot-teleop combination
+    teleop_action_processor, robot_action_processor, robot_observation_processor = make_processors_for(
+        robot_type=cfg.robot.type,
+        teleop_config=cfg.teleop,
+    )
 
     dataset_features = combine_feature_dicts(
         aggregate_pipeline_dataset_features(

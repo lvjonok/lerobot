@@ -14,13 +14,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Optional
 
+from pynput import keyboard
+
 from ..config import TeleoperatorConfig
 from ..teleoperator import Teleoperator
 from ..utils import TeleopEvents
+from .haply_utils import HaplyController
 
 
 class GripperAction(IntEnum):
@@ -40,6 +44,22 @@ gripper_action_map = {
 @dataclass
 class HaplyTeleopConfig(TeleoperatorConfig):
     use_gripper: bool = True
+
+    # Haply Inverse Service WebSocket URI
+    ws_uri: str = "ws://localhost:10001"
+
+    # Control scaling (used by processor, stored here for preset convenience)
+    translation_scale: float = 1.0
+    rotation_scale: float = 1.0
+
+    # Teleop mode — which axes are actuated (used by processor)
+    teleop_mode: str = "left_arm_6DOF"
+
+    # Gripper
+    max_gripper_width: float = 0.08  # meters
+
+    # Force feedback
+    enable_feedback: bool = False
 
 
 class HaplyTeleop(Teleoperator):
@@ -93,17 +113,25 @@ class HaplyTeleop(Teleoperator):
 
     def connect(self, calibrate: bool = False) -> None:
         """Connect to the Haply device and start keyboard listener."""
-        # Try importing here to avoid dependency if not used
-        try:
-            from .haply_utils import HaplyController
-        except ImportError as e:
-            raise ImportError(
-                "HaplyTeleop requires the websockets and orjson packages. "
-                "Please install them: pip install websockets orjson"
-            ) from e
 
-        self.haply_device = HaplyController()
+        self.haply_device = HaplyController(uri=self.config.ws_uri)
         self.haply_device.start()
+
+        # Wait for connection to establish
+        timeout = 5.0
+        start = time.time()
+        while time.time() - start < timeout:
+            if self.haply_device.running and self.haply_device.inverse3_device_id is not None:
+                break
+            time.sleep(0.1)
+
+        if not self.haply_device.running:
+            self.haply_device.stop()
+            self.haply_device = None
+            raise ConnectionError(
+                f"Failed to connect to Haply Inverse Service at {self.config.ws_uri}. "
+                "Make sure the Inverse Service is running."
+            )
 
         # Start keyboard listener for 'R' key
         self._start_keyboard_listener()
@@ -206,22 +234,15 @@ class HaplyTeleop(Teleoperator):
 
     def _start_keyboard_listener(self) -> None:
         """Start listening for keyboard events."""
-        try:
-            from pynput import keyboard
+        def on_press(key):
+            try:
+                if hasattr(key, "char") and key.char == "r":
+                    self.rerecord_requested = True
+            except AttributeError:
+                pass
 
-            def on_press(key):
-                try:
-                    if hasattr(key, "char") and key.char == "r":
-                        self.rerecord_requested = True
-                except AttributeError:
-                    pass
-
-            self.keyboard_listener = keyboard.Listener(on_press=on_press)
-            self.keyboard_listener.start()
-        except ImportError:
-            import logging
-
-            logging.warning("pynput not installed. Keyboard 'R' for rerecord will not work.")
+        self.keyboard_listener = keyboard.Listener(on_press=on_press)
+        self.keyboard_listener.start()
 
     def _stop_keyboard_listener(self) -> None:
         """Stop the keyboard listener."""
