@@ -1,0 +1,37 @@
+# Teleoperation config: Franka + Meta Quest VR + two RealSense cameras
+#
+# Usage:
+#   lerobot-teleoperate --config_path=configs/teleoperate/franka_meta_quest.yaml
+#
+# Override any field via CLI:
+#   lerobot-teleoperate --config_path=configs/teleoperate/franka_meta_quest.yaml --fps=60
+
+robot:
+  type: crisp_fastapi
+  server_url: "http://192.168.50.67:8092"
+  max_gripper_width: 0.078
+  gripper_velocity: 0.15
+  gripper_force: 20.0
+  cameras:
+    external_camera:
+      type: intelrealsense
+      serial_number_or_name: "838212074376"
+      fps: 30
+      width: 640
+      height: 480
+    left_wrist_camera:
+      type: intelrealsense
+      serial_number_or_name: "130322271369"
+      fps: 30
+      width: 640
+      height: 480
+
+teleop:
+  type: meta_quest
+  multicast_group: "224.1.1.1"
+  control_hand: "right"
+  translation_scale: 1.0
+  teleop_mode: "left_arm_3D_translation_Z_rotation"
+
+fps: 30
+visualize: true

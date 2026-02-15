@@ -13,6 +13,8 @@
 # limitations under the License.
 
 ### Environments & Dependencies ###
+.pixi/
+pixi.lock
 .env
 .venv
 env/

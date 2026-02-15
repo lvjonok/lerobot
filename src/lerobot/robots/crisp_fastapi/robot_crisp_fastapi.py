@@ -6,8 +6,10 @@ Works with any robot that exposes the crisp_py REST interface.
 """
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from functools import cached_property
 from typing import Any
+import time
 
 import numpy as np
 
@@ -18,6 +20,9 @@ from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnected
 from .config_crisp_fastapi import CrispFastAPIConfig
 
 logger = logging.getLogger(__name__)
+
+# Suppress verbose httpx HTTP request logging (INFO level logs every request)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 class CrispFastAPIRobot(Robot):
@@ -36,6 +41,7 @@ class CrispFastAPIRobot(Robot):
         self.config = config
         self._connected = False
         self._client = None
+        self._pool = None
 
         # Initialize cameras
         self.cameras = {}
@@ -56,6 +62,8 @@ class CrispFastAPIRobot(Robot):
             "wrench.torque": (3,),
             "ft_sensor.force": (3,),
             "ft_sensor.torque": (3,),
+            "joint.pos": (7,),
+            "joint.vel": (7,),
         }
 
         for cam_key, cam in self.cameras.items():
@@ -101,6 +109,7 @@ class CrispFastAPIRobot(Robot):
             base_url=self.config.server_url,
             timeout=self.config.timeout,
         )
+        self._pool = ThreadPoolExecutor(max_workers=2)
 
         try:
             response = self._client.get("/get_current_robot_states")
@@ -131,10 +140,11 @@ class CrispFastAPIRobot(Robot):
         """Retrieve current observation from the robot."""
         if not self._connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
-
+        t0 = time.perf_counter()
         response = self._client.get("/get_current_robot_states")
         response.raise_for_status()
         state = response.json()
+        # logger.info(f"Time: {(time.perf_counter() - t0)*1e3 :0.1f} ms")
 
         tcp = state.get("leftRobotTCP", [0, 0, 0, 1, 0, 0, 0])
         tcp_pos = np.array(tcp[:3], dtype=np.float32)
@@ -151,6 +161,13 @@ class CrispFastAPIRobot(Robot):
         ft_force = np.array(ft_wrench[:3], dtype=np.float32)
         ft_torque = np.array(ft_wrench[3:], dtype=np.float32)
 
+        joint_pos = np.array(
+            state.get("leftJointPositions", [0] * 7), dtype=np.float32
+        )
+        joint_vel = np.array(
+            state.get("leftJointVelocities", [0] * 7), dtype=np.float32
+        )
+
         obs = {
             "tcp.pos": tcp_pos,
             "tcp.quat": tcp_quat,
@@ -159,6 +176,8 @@ class CrispFastAPIRobot(Robot):
             "wrench.torque": wrench_torque,
             "ft_sensor.force": ft_force,
             "ft_sensor.torque": ft_torque,
+            "joint.pos": joint_pos,
+            "joint.vel": joint_vel,
         }
 
         for cam_key, cam in self.cameras.items():
@@ -183,28 +202,34 @@ class CrispFastAPIRobot(Robot):
 
         target_tcp = np.concatenate([tcp_pos, tcp_quat]).tolist()
 
-        try:
-            response = self._client.post(
-                "/move_tcp/left",
-                json={"target_tcp": target_tcp, "feedforward_wrench": None},
-            )
-            response.raise_for_status()
-        except Exception as e:
-            logger.error(f"Failed to send TCP command: {e}")
+        def _send_tcp():
+            try:
+                r = self._client.post(
+                    "/move_tcp/left",
+                    json={"target_tcp": target_tcp, "feedforward_wrench": None},
+                )
+                r.raise_for_status()
+            except Exception as e:
+                logger.error(f"Failed to send TCP command: {e}")
 
-        try:
-            response = self._client.post(
-                "/move_gripper/left",
-                json={
-                    "width": gripper_pos,
-                    "velocity": self.config.gripper_velocity,
-                    "force_limit": self.config.gripper_force,
-                },
-            )
-            response.raise_for_status()
-        except Exception as e:
-            logger.error(f"Failed to send gripper command: {e}")
+        def _send_gripper():
+            try:
+                r = self._client.post(
+                    "/move_gripper/left",
+                    json={
+                        "width": gripper_pos,
+                        "velocity": self.config.gripper_velocity,
+                        "force_limit": self.config.gripper_force,
+                    },
+                )
+                r.raise_for_status()
+            except Exception as e:
+                logger.error(f"Failed to send gripper command: {e}")
 
+        f_tcp = self._pool.submit(_send_tcp)
+        f_grip = self._pool.submit(_send_gripper)
+        f_tcp.result()
+        f_grip.result()
         return {
             "tcp.pos": tcp_pos,
             "tcp.quat": tcp_quat,
@@ -235,6 +260,10 @@ class CrispFastAPIRobot(Robot):
                 logger.info(f"Disconnected camera: {cam_key}")
             except Exception as e:
                 logger.warning(f"Failed to disconnect camera {cam_key}: {e}")
+
+        if self._pool is not None:
+            self._pool.shutdown(wait=False)
+            self._pool = None
 
         if self._client is not None:
             self._client.close()

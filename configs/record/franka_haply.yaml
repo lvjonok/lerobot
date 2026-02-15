@@ -1,0 +1,49 @@
+# Recording config: Franka + Haply Inverse3 + two RealSense cameras
+#
+# Usage:
+#   lerobot-record --config_path=configs/record/franka_haply.yaml \
+#     --dataset.repo_id=<user>/<dataset_name> \
+#     --dataset.single_task="<task description>"
+#
+# Override any field via CLI:
+#   lerobot-record --config_path=configs/record/franka_haply.yaml \
+#     --dataset.repo_id=<user>/<dataset_name> \
+#     --dataset.single_task="Pick up the block" \
+#     --dataset.num_episodes=10
+
+robot:
+  type: crisp_fastapi
+  server_url: "http://localhost:8092"
+  max_gripper_width: 0.078
+  gripper_velocity: 0.15
+  gripper_force: 20.0
+  cameras:
+    external_camera:
+      type: intelrealsense
+      serial_number_or_name: "838212074376"
+      fps: 30
+      width: 640
+      height: 480
+    left_wrist_camera:
+      type: intelrealsense
+      serial_number_or_name: "130322271369"
+      fps: 30
+      width: 640
+      height: 480
+
+teleop:
+  type: haply
+  ws_uri: "ws://localhost:10001"
+  teleop_mode: "left_arm_3D_translation_Z_rotation"
+
+dataset:
+  repo_id: "PLACEHOLDER/REPLACE_ME"
+  single_task: "PLACEHOLDER: describe your task here"
+  fps: 30
+  num_episodes: 50
+  episode_time_s: 60
+  reset_time_s: 60
+  video: true
+  push_to_hub: false
+
+display_data: true

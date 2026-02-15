@@ -1,0 +1,58 @@
+[workspace]
+authors = ["Domrachev Ivan <domrachev03@mail.ru>"]
+channels = ["https://prefix.dev/conda-forge"]
+name = "lerobot"
+platforms = ["linux-64"]
+version = "0.4.3"
+
+[tasks]
+teleoperate = "lerobot-teleoperate"
+record = "lerobot-record"
+train = "lerobot-train"
+eval = "lerobot-eval"
+
+[dependencies]
+python = ">=3.10,<3.12"
+setuptools = ">=71.0.0,<81"
+cmake = ">=3.29.0.1,<5"
+pkg-config = ">=0.29.2,<0.30"
+pip = ">=25.3,<26"
+
+[pypi-dependencies]
+# Install lerobot itself (editable) — pulls in all core deps from pyproject.toml
+lerobot = { path = ".", editable = true }
+
+# --- RDP plugin dependencies (not in upstream pyproject.toml) ---
+
+# Web/API — required by crisp_fastapi robot (HTTP REST client)
+httpx = ">=0.28.1,<0.29"
+
+# Haply teleoperator
+websockets = ">=14.0,<16"
+orjson = ">=3.10,<4"
+
+# SpaceMouse teleoperator
+spnav = { url = "https://github.com/cheng-chi/spnav/archive/c1c938ebe3cc542db4685e0d13850ff1abfdb943.tar.gz" }
+
+# Meta Quest teleoperator
+meta-teleop = { path = "../meta-teleop-client", editable = true }
+
+# Intel RealSense cameras
+pyrealsense2 = ">=2.55.1.6486,<3"
+
+# Spatial math (processors, teleoperators)
+scipy = "*"
+
+rerun-sdk=">=0.24.0"
+
+[feature.cpu.pypi-dependencies]
+torch = { version = ">=2.2.1,<2.8", index = "https://download.pytorch.org/whl/cpu" }
+torchvision = { version = ">=0.21.0,<0.23", index = "https://download.pytorch.org/whl/cpu" }
+
+[feature.cuda.pypi-dependencies]
+torch = { version = ">=2.2.1,<2.8", index = "https://download.pytorch.org/whl/cu124" }
+torchvision = { version = ">=0.21.0,<0.23", index = "https://download.pytorch.org/whl/cu124" }
+
+[environments]
+default = ["cpu"]
+cuda = ["cuda"]

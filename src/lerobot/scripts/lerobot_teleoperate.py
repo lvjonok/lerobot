@@ -52,9 +52,11 @@ lerobot-teleoperate \
 """
 
 import logging
+import multiprocessing
 import time
 from dataclasses import asdict, dataclass
 from pprint import pformat
+from typing import Any
 
 import rerun as rr
 
@@ -103,6 +105,57 @@ from lerobot.utils.utils import init_logging, move_cursor_up
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 
+class RerunLoggerProcess:
+    """Offloads Rerun logging to a separate process, fully isolating it from the control loop's GIL."""
+
+    def __init__(self):
+        self._queue: multiprocessing.Queue = multiprocessing.Queue(maxsize=2)
+        self._process = multiprocessing.Process(
+            target=self._run, args=(self._queue,), daemon=True, name="rerun_logger"
+        )
+        self._process.start()
+
+    def log(self, observation: dict[str, Any], action: dict[str, Any]) -> None:
+        """Submit data for logging (non-blocking, drops oldest frame if the logger falls behind)."""
+        try:
+            self._queue.put_nowait((observation, action))
+        except multiprocessing.queues.Full:
+            try:
+                self._queue.get_nowait()  # discard oldest
+            except multiprocessing.queues.Empty:
+                pass
+            try:
+                self._queue.put_nowait((observation, action))
+            except multiprocessing.queues.Full:
+                pass  # skip frame
+
+    @staticmethod
+    def _run(queue: multiprocessing.Queue) -> None:
+        # All Rerun state lives in this child process — no GIL sharing with control loop
+        init_rerun(session_name="teleoperation")
+        while True:
+            try:
+                # Drain queue and only log the latest frame
+                data = queue.get(timeout=1.0)
+                while not queue.empty():
+                    try:
+                        data = queue.get_nowait()
+                    except multiprocessing.queues.Empty:
+                        break
+                log_rerun_data(observation=data[0], action=data[1])
+            except multiprocessing.queues.Empty:
+                continue
+            except (EOFError, KeyboardInterrupt):
+                break
+        rr.rerun_shutdown()
+
+    def stop(self) -> None:
+        self._queue.close()
+        self._process.join(timeout=3.0)
+        if self._process.is_alive():
+            self._process.terminate()
+
+
 @dataclass
 class TeleoperateConfig:
     # TODO: pepijn, steven: if more robots require multiple teleoperators (like lekiwi) its good to make this possibele in teleop.py and record.py with List[Teleoperator]
@@ -111,8 +164,10 @@ class TeleoperateConfig:
     # Limit the maximum frames per second.
     fps: int = 60
     teleop_time_s: float | None = None
-    # Display all cameras on screen
+    # Display action values in the terminal
     display_data: bool = False
+    # Visualize observations and actions in Rerun viewer
+    visualize: bool = False
 
 
 def teleop_loop(
@@ -123,6 +178,7 @@ def teleop_loop(
     robot_action_processor: RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction],
     robot_observation_processor: RobotProcessorPipeline[RobotObservation, RobotObservation],
     display_data: bool = False,
+    rerun_logger: RerunLoggerProcess | None = None,
     duration: float | None = None,
 ):
     """
@@ -134,7 +190,9 @@ def teleop_loop(
         teleop: The teleoperator device instance providing control actions.
         robot: The robot instance being controlled.
         fps: The target frequency for the control loop in frames per second.
-        display_data: If True, fetches robot observations and displays them in the console and Rerun.
+        display_data: If True, displays action values in the terminal.
+        rerun_logger: Background Rerun logger thread. If provided, observations and actions are logged
+            asynchronously without blocking the control loop.
         duration: The maximum duration of the teleoperation loop in seconds. If None, the loop runs indefinitely.
         teleop_action_processor: An optional pipeline to process raw actions from the teleoperator.
         robot_action_processor: An optional pipeline to process actions before they are sent to the robot.
@@ -148,9 +206,6 @@ def teleop_loop(
         loop_start = time.perf_counter()
 
         # Get robot observation
-        # Not really needed for now other than for visualization
-        # teleop_action_processor can take None as an observation
-        # given that it is the identity processor as default
         obs = robot.get_observation()
 
         # Get teleop action
@@ -165,15 +220,12 @@ def teleop_loop(
         # Send processed action to robot (robot_action_processor.to_output should return dict[str, Any])
         _ = robot.send_action(robot_action_to_send)
 
-        if display_data:
-            # Process robot observation through pipeline
+        if rerun_logger is not None:
+            # Process observation and hand off to background process (non-blocking)
             obs_transition = robot_observation_processor(obs)
+            rerun_logger.log(observation=obs_transition, action=teleop_action)
 
-            log_rerun_data(
-                observation=obs_transition,
-                action=teleop_action,
-            )
-
+        if display_data:
             print("\n" + "-" * (display_len + 10))
             print(f"{'NAME':<{display_len}} | {'NORM':>7}")
             # Display the final robot action that was sent
@@ -195,8 +247,10 @@ def teleop_loop(
 def teleoperate(cfg: TeleoperateConfig):
     init_logging()
     logging.info(pformat(asdict(cfg)))
-    if cfg.display_data:
-        init_rerun(session_name="teleoperation")
+
+    rerun_logger = None
+    if cfg.visualize:
+        rerun_logger = RerunLoggerProcess()
 
     teleop = make_teleoperator_from_config(cfg.teleop)
     robot = make_robot_from_config(cfg.robot)
@@ -216,6 +270,7 @@ def teleoperate(cfg: TeleoperateConfig):
             robot=robot,
             fps=cfg.fps,
             display_data=cfg.display_data,
+            rerun_logger=rerun_logger,
             duration=cfg.teleop_time_s,
             teleop_action_processor=teleop_action_processor,
             robot_action_processor=robot_action_processor,
@@ -224,8 +279,8 @@ def teleoperate(cfg: TeleoperateConfig):
     except KeyboardInterrupt:
         pass
     finally:
-        if cfg.display_data:
-            rr.rerun_shutdown()
+        if rerun_logger is not None:
+            rerun_logger.stop()
         teleop.disconnect()
 
         # possibly move robot home
