@@ -44,7 +44,7 @@ dataset:
   fps: 30
   num_episodes: 50
   episode_time_s: 60
-  reset_time_s: 60
+  reset_time_s: 0
   video: true
   push_to_hub: false
 

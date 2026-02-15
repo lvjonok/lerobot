@@ -76,10 +76,10 @@ class CrispFastAPIRobot(Robot):
 
     @cached_property
     def action_features(self) -> dict:
-        """Dictionary describing action structure."""
+        """Dictionary describing action structure (6DOF twist + gripper)."""
         return {
-            "tcp.pos": (3,),
-            "tcp.quat": (4,),
+            "linear_vel": (3,),
+            "angular_vel": (3,),
             "gripper.pos": float,
         }
 
@@ -200,7 +200,7 @@ class CrispFastAPIRobot(Robot):
         tcp_quat = np.array(action.get("tcp.quat", [1, 0, 0, 0]), dtype=np.float32)
         gripper_pos = float(action.get("gripper.pos", 0.04))
 
-        target_tcp = np.concatenate([tcp_pos, tcp_quat]).tolist()
+        target_tcp = np.eoncatenate([tcp_pos, tcp_quat]).tolist()
 
         try:
             r = self._client.post(

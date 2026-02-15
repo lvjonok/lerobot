@@ -196,9 +196,17 @@ def make_robot_action(action_tensor: PolicyAction, ds_features: dict[str, dict])
     action_tensor = action_tensor.to("cpu")
 
     action_names = ds_features[ACTION]["names"]
-    act_processed_policy: RobotAction = {
-        f"{name}": float(action_tensor[i]) for i, name in enumerate(action_names)
-    }
+    feature_sizes = ds_features[ACTION].get("feature_sizes", {n: 1 for n in action_names})
+
+    act_processed_policy: RobotAction = {}
+    idx = 0
+    for name in action_names:
+        size = feature_sizes.get(name, 1)
+        if size == 1:
+            act_processed_policy[name] = float(action_tensor[idx])
+        else:
+            act_processed_policy[name] = action_tensor[idx : idx + size].numpy().astype(np.float32)
+        idx += size
     return act_processed_policy
 
 

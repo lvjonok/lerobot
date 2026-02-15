@@ -637,23 +637,37 @@ def hw_to_dataset_features(
     joint_fts = {
         key: ftype
         for key, ftype in hw_features.items()
-        if ftype is float or (isinstance(ftype, PolicyFeature) and ftype.type != FeatureType.VISUAL)
+        if ftype is float
+        or (isinstance(ftype, tuple) and len(ftype) == 1)
+        or (isinstance(ftype, PolicyFeature) and ftype.type != FeatureType.VISUAL)
     }
-    cam_fts = {key: shape for key, shape in hw_features.items() if isinstance(shape, tuple)}
+    cam_fts = {key: shape for key, shape in hw_features.items() if isinstance(shape, tuple) and len(shape) >= 2}
 
-    if joint_fts and prefix == ACTION:
-        features[prefix] = {
+    if joint_fts:
+        # Compute per-feature dimensions and total dimension
+        feature_sizes = {}
+        for key, ftype in joint_fts.items():
+            if ftype is float:
+                feature_sizes[key] = 1
+            elif isinstance(ftype, tuple) and len(ftype) == 1:
+                feature_sizes[key] = ftype[0]
+            elif isinstance(ftype, PolicyFeature):
+                feature_sizes[key] = 1
+            else:
+                feature_sizes[key] = 1
+        total_dim = sum(feature_sizes.values())
+
+        ft_spec = {
             "dtype": "float32",
-            "shape": (len(joint_fts),),
+            "shape": (total_dim,),
             "names": list(joint_fts),
+            "feature_sizes": feature_sizes,
         }
 
-    if joint_fts and prefix == OBS_STR:
-        features[f"{prefix}.state"] = {
-            "dtype": "float32",
-            "shape": (len(joint_fts),),
-            "names": list(joint_fts),
-        }
+        if prefix == ACTION:
+            features[prefix] = ft_spec
+        elif prefix == OBS_STR:
+            features[f"{prefix}.state"] = ft_spec
 
     for key, shape in cam_fts.items():
         features[f"{prefix}.images.{key}"] = {
@@ -688,7 +702,17 @@ def build_dataset_frame(
         if key in DEFAULT_FEATURES or not key.startswith(prefix):
             continue
         elif ft["dtype"] == "float32" and len(ft["shape"]) == 1:
-            frame[key] = np.array([values[name] for name in ft["names"]], dtype=np.float32)
+            # Concatenate arrays and scalars into a single flat vector
+            parts = []
+            for name in ft["names"]:
+                val = values[name]
+                if isinstance(val, np.ndarray):
+                    parts.append(val.flatten().astype(np.float32))
+                elif isinstance(val, (list, tuple)):
+                    parts.append(np.array(val, dtype=np.float32).flatten())
+                else:
+                    parts.append(np.array([float(val)], dtype=np.float32))
+            frame[key] = np.concatenate(parts)
         elif ft["dtype"] in ["image", "video"]:
             frame[key] = values[key.removeprefix(f"{prefix}.images.")]
 
@@ -779,14 +803,20 @@ def combine_feature_dicts(*dicts: dict) -> dict:
                 if "dtype" in target and dtype != target["dtype"]:
                     raise ValueError(f"dtype mismatch for '{key}': {target['dtype']} vs {dtype}")
 
+                # Track per-feature dimensions for proper shape computation
+                target_sizes = target.get("feature_sizes", {n: 1 for n in target["names"]})
+                value_sizes = value.get("feature_sizes", {n: 1 for n in value["names"]})
+
                 # Merge feature names: append only new ones to preserve order without duplicates
                 seen = set(target["names"])
                 for n in value["names"]:
                     if n not in seen:
                         target["names"].append(n)
+                        target_sizes[n] = value_sizes.get(n, 1)
                         seen.add(n)
-                # Recompute the shape to reflect the updated number of features
-                target["shape"] = (len(target["names"]),)
+                target["feature_sizes"] = target_sizes
+                # Recompute the shape using per-feature dimensions
+                target["shape"] = (sum(target_sizes.values()),)
             else:
                 # For images/videos and non-1D entries: override with the latest definition
                 out[key] = value

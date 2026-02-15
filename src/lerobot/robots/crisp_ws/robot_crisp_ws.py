@@ -78,9 +78,10 @@ class CrispWSRobot(Robot):
 
     @cached_property
     def action_features(self) -> dict:
+        """Dictionary describing action structure (6DOF twist + gripper)."""
         return {
-            "tcp.pos": (3,),
-            "tcp.quat": (4,),
+            "linear_vel": (3,),
+            "angular_vel": (3,),
             "gripper.pos": float,
         }
 

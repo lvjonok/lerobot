@@ -94,6 +94,7 @@ from lerobot.robots import (  # noqa: F401
     RobotConfig,
     bi_so100_follower,
     crisp_fastapi,
+    crisp_ws,
     earthrover_mini_plus,
     hope_jr,
     koch_follower,
@@ -360,8 +361,6 @@ def record_loop(
             action_values = act_processed_teleop
             robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
 
-        # Send action to robot
-        print(f"Want to send action: {robot_action_to_send}")
         # Action can eventually be clipped using `max_relative_target`,
         # so action actually sent is saved in the dataset. action = postprocessor.process(action)
         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
@@ -469,6 +468,19 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+                # Move robot to home position before each episode
+                if hasattr(robot, "go_home"):
+                    log_say("Going home", cfg.play_sounds)
+                    try:
+                        robot.go_home()
+                    except Exception as e:
+                        logging.warning(f"Failed to go home: {e}")
+
+                # Reset processor state so they re-initialize from current (home) pose
+                teleop_action_processor.reset()
+                robot_action_processor.reset()
+
+                input("Press Enter to start recording...")
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
                 record_loop(
                     robot=robot,

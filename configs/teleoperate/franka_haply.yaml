@@ -7,8 +7,9 @@
 #   lerobot-teleoperate --config_path=configs/teleoperate/franka_haply.yaml --fps=60
 
 robot:
-  type: crisp_fastapi
-  server_url: "http://localhost:8092"
+  type: crisp_ws
+  ws_url: "ws://localhost:8092/ws"
+  # server_url: "http://localhost:8092"
   max_gripper_width: 0.078
   gripper_velocity: 0.15
   gripper_force: 20.0

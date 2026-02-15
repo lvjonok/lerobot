@@ -12,8 +12,8 @@
 #     --dataset.num_episodes=10
 
 robot:
-  type: crisp_fastapi
-  server_url: "http://localhost:8092"
+  type: crisp_ws
+  ws_url: "ws://localhost:8092/ws"
   max_gripper_width: 0.078
   gripper_velocity: 0.15
   gripper_force: 20.0
@@ -42,7 +42,7 @@ dataset:
   fps: 30
   num_episodes: 50
   episode_time_s: 60
-  reset_time_s: 60
+  reset_time_s: 0
   video: true
   push_to_hub: false
 

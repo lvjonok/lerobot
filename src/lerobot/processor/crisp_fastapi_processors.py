@@ -16,6 +16,8 @@ from typing import Any
 import numpy as np
 import scipy.spatial.transform as st
 
+from lerobot.configs.types import PipelineFeatureType
+
 from .core import RobotAction, TransitionKey
 from .pipeline import ProcessorStepRegistry, RobotActionProcessorStep
 
@@ -97,11 +99,12 @@ class SpaceMouseDeltaToAbsoluteProcessor(RobotActionProcessorStep):
     def transform_features(
         self, features: dict, in_key: str | None = None, out_key: str | None = None
     ) -> dict:
-        return {
-            self.robot_pos_key: {"dtype": "float32", "shape": (3,), "names": None},
-            self.robot_quat_key: {"dtype": "float32", "shape": (4,), "names": None},
-            self.robot_gripper_key: {"dtype": "float32", "shape": (1,), "names": None},
+        features[PipelineFeatureType.ACTION] = {
+            self.robot_pos_key: (3,),
+            self.robot_quat_key: (4,),
+            self.robot_gripper_key: float,
         }
+        return features
 
     def get_config(self) -> dict:
         return {
@@ -197,11 +200,12 @@ class DeltaPoseToAbsoluteProcessor(RobotActionProcessorStep):
     def transform_features(
         self, features: dict, in_key: str | None = None, out_key: str | None = None
     ) -> dict:
-        return {
-            self.pos_key: {"dtype": "float32", "shape": (3,), "names": None},
-            self.quat_key: {"dtype": "float32", "shape": (4,), "names": None},
-            self.gripper_key: {"dtype": "float32", "shape": (1,), "names": None},
+        features[PipelineFeatureType.ACTION] = {
+            self.pos_key: (3,),
+            self.quat_key: (4,),
+            self.gripper_key: float,
         }
+        return features
 
     def get_config(self) -> dict:
         return {
@@ -387,11 +391,12 @@ class HaplyToCrispClutchProcessor(RobotActionProcessorStep):
     def transform_features(
         self, features: dict, in_key: str | None = None, out_key: str | None = None
     ) -> dict:
-        return {
-            self.robot_pos_key: {"dtype": "float32", "shape": (3,), "names": None},
-            self.robot_quat_key: {"dtype": "float32", "shape": (4,), "names": None},
-            self.robot_gripper_key: {"dtype": "float32", "shape": (1,), "names": None},
+        features[PipelineFeatureType.ACTION] = {
+            self.robot_pos_key: (3,),
+            self.robot_quat_key: (4,),
+            self.robot_gripper_key: float,
         }
+        return features
 
     def get_config(self) -> dict:
         return {
@@ -416,3 +421,182 @@ class HaplyToCrispClutchProcessor(RobotActionProcessorStep):
         self._initial_robot_quat_wxyz = None
         self._gripper_open = True
         self._initialized = False
+
+
+@ProcessorStepRegistry.register("absolute_to_twist")
+@dataclass
+class AbsoluteToTwistProcessor(RobotActionProcessorStep):
+    """Convert absolute TCP target to twist (linear_vel + angular_vel).
+
+    Takes absolute target pose from a preceding processor step and the
+    current robot pose from observation, computes the twist:
+        linear_vel = target_pos - current_pos
+        angular_vel = (target_rot * current_rot^-1).as_rotvec()
+
+    Input (from preceding processor):
+        - tcp.pos: (3,) absolute target position
+        - tcp.quat: (4,) absolute target quaternion (wxyz)
+        - gripper.pos: float gripper width
+
+    Output:
+        - linear_vel: (3,) position displacement
+        - angular_vel: (3,) rotation vector displacement
+        - gripper.pos: float gripper width
+    """
+
+    # Input keys (from preceding absolute-pose processor)
+    input_pos_key: str = "tcp.pos"
+    input_quat_key: str = "tcp.quat"
+    input_gripper_key: str = "gripper.pos"
+
+    # Output keys (twist format)
+    output_linear_vel_key: str = "linear_vel"
+    output_angular_vel_key: str = "angular_vel"
+    output_gripper_key: str = "gripper.pos"
+
+    # Observation keys for current robot pose
+    obs_pos_key: str = "tcp.pos"
+    obs_quat_key: str = "tcp.quat"
+
+    def action(self, action: RobotAction) -> RobotAction:
+        obs = self.transition.get(TransitionKey.OBSERVATION, {})
+
+        target_pos = np.array(action[self.input_pos_key], dtype=np.float32)
+        target_quat_wxyz = np.array(action[self.input_quat_key], dtype=np.float32)
+        gripper = action[self.input_gripper_key]
+
+        current_pos = np.array(obs[self.obs_pos_key], dtype=np.float32)
+        current_quat_wxyz = np.array(obs[self.obs_quat_key], dtype=np.float32)
+
+        # Linear velocity = position displacement
+        linear_vel = target_pos - current_pos
+
+        # Angular velocity = rotation displacement as rotation vector
+        target_rot = st.Rotation.from_quat([
+            target_quat_wxyz[1], target_quat_wxyz[2],
+            target_quat_wxyz[3], target_quat_wxyz[0],
+        ])
+        current_rot = st.Rotation.from_quat([
+            current_quat_wxyz[1], current_quat_wxyz[2],
+            current_quat_wxyz[3], current_quat_wxyz[0],
+        ])
+        delta_rot = target_rot * current_rot.inv()
+        angular_vel = delta_rot.as_rotvec().astype(np.float32)
+
+        return {
+            self.output_linear_vel_key: linear_vel,
+            self.output_angular_vel_key: angular_vel,
+            self.output_gripper_key: gripper,
+        }
+
+    def transform_features(
+        self, features: dict, in_key: str | None = None, out_key: str | None = None
+    ) -> dict:
+        features[PipelineFeatureType.ACTION] = {
+            self.output_linear_vel_key: (3,),
+            self.output_angular_vel_key: (3,),
+            self.output_gripper_key: float,
+        }
+        return features
+
+    def get_config(self) -> dict:
+        return {
+            "input_pos_key": self.input_pos_key,
+            "input_quat_key": self.input_quat_key,
+            "input_gripper_key": self.input_gripper_key,
+            "output_linear_vel_key": self.output_linear_vel_key,
+            "output_angular_vel_key": self.output_angular_vel_key,
+            "output_gripper_key": self.output_gripper_key,
+        }
+
+    def reset(self) -> None:
+        pass
+
+
+@ProcessorStepRegistry.register("twist_to_absolute_pose")
+@dataclass
+class TwistToAbsolutePoseProcessor(RobotActionProcessorStep):
+    """Convert twist (linear_vel + angular_vel) to absolute TCP target.
+
+    Takes twist from a preceding processor step and the current robot
+    pose from observation, computes the absolute target:
+        target_pos = current_pos + linear_vel
+        target_rot = Rotation.from_rotvec(angular_vel) * current_rot
+
+    Input:
+        - linear_vel: (3,) position displacement
+        - angular_vel: (3,) rotation vector displacement
+        - gripper.pos: float gripper width
+
+    Output:
+        - tcp.pos: (3,) absolute target position
+        - tcp.quat: (4,) absolute target quaternion (wxyz)
+        - gripper.pos: float gripper width
+    """
+
+    # Input keys (twist format)
+    input_linear_vel_key: str = "linear_vel"
+    input_angular_vel_key: str = "angular_vel"
+    input_gripper_key: str = "gripper.pos"
+
+    # Output keys (absolute pose)
+    output_pos_key: str = "tcp.pos"
+    output_quat_key: str = "tcp.quat"
+    output_gripper_key: str = "gripper.pos"
+
+    # Observation keys for current robot pose
+    obs_pos_key: str = "tcp.pos"
+    obs_quat_key: str = "tcp.quat"
+
+    def action(self, action: RobotAction) -> RobotAction:
+        obs = self.transition.get(TransitionKey.OBSERVATION, {})
+
+        linear_vel = np.array(action[self.input_linear_vel_key], dtype=np.float32)
+        angular_vel = np.array(action[self.input_angular_vel_key], dtype=np.float32)
+        gripper = action[self.input_gripper_key]
+
+        current_pos = np.array(obs[self.obs_pos_key], dtype=np.float32)
+        current_quat_wxyz = np.array(obs[self.obs_quat_key], dtype=np.float32)
+
+        target_pos = current_pos + linear_vel
+
+        current_rot = st.Rotation.from_quat([
+            current_quat_wxyz[1], current_quat_wxyz[2],
+            current_quat_wxyz[3], current_quat_wxyz[0],
+        ])
+        delta_rot = st.Rotation.from_rotvec(angular_vel)
+        target_rot = delta_rot * current_rot
+        target_quat_xyzw = target_rot.as_quat().astype(np.float32)
+        target_quat_wxyz = np.array(
+            [target_quat_xyzw[3], target_quat_xyzw[0], target_quat_xyzw[1], target_quat_xyzw[2]],
+            dtype=np.float32,
+        )
+
+        return {
+            self.output_pos_key: target_pos,
+            self.output_quat_key: target_quat_wxyz,
+            self.output_gripper_key: gripper,
+        }
+
+    def transform_features(
+        self, features: dict, in_key: str | None = None, out_key: str | None = None
+    ) -> dict:
+        features[PipelineFeatureType.ACTION] = {
+            self.output_pos_key: (3,),
+            self.output_quat_key: (4,),
+            self.output_gripper_key: float,
+        }
+        return features
+
+    def get_config(self) -> dict:
+        return {
+            "input_linear_vel_key": self.input_linear_vel_key,
+            "input_angular_vel_key": self.input_angular_vel_key,
+            "input_gripper_key": self.input_gripper_key,
+            "output_pos_key": self.output_pos_key,
+            "output_quat_key": self.output_quat_key,
+            "output_gripper_key": self.output_gripper_key,
+        }
+
+    def reset(self) -> None:
+        pass

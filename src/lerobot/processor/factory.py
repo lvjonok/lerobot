@@ -77,42 +77,74 @@ def make_processors_for(
     """
     teleop_type = teleop_config.type if teleop_config is not None else None
 
-    if teleop_type == "spacemouse" and robot_type == "crisp_fastapi":
-        from .crisp_fastapi_processors import SpaceMouseDeltaToAbsoluteProcessor
+    crisp_robots = {"crisp_fastapi", "crisp_ws"}
+
+    if teleop_type == "spacemouse" and robot_type in crisp_robots:
+        from .crisp_fastapi_processors import (
+            AbsoluteToTwistProcessor,
+            SpaceMouseDeltaToAbsoluteProcessor,
+            TwistToAbsolutePoseProcessor,
+        )
 
         teleop_action_processor = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
-            steps=[SpaceMouseDeltaToAbsoluteProcessor()],
+            steps=[SpaceMouseDeltaToAbsoluteProcessor(), AbsoluteToTwistProcessor()],
             to_transition=robot_action_observation_to_transition,
             to_output=transition_to_robot_action,
         )
-        _, robot_action_processor, robot_observation_processor = make_default_processors()
+        robot_action_processor = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
+            steps=[TwistToAbsolutePoseProcessor()],
+            to_transition=robot_action_observation_to_transition,
+            to_output=transition_to_robot_action,
+        )
+        robot_observation_processor = make_default_robot_observation_processor()
         return teleop_action_processor, robot_action_processor, robot_observation_processor
 
-    elif teleop_type == "haply" and robot_type == "crisp_fastapi":
-        from .crisp_fastapi_processors import HaplyToCrispClutchProcessor
+    elif teleop_type == "haply" and robot_type in crisp_robots:
+        from .crisp_fastapi_processors import (
+            AbsoluteToTwistProcessor,
+            HaplyToCrispClutchProcessor,
+            TwistToAbsolutePoseProcessor,
+        )
 
         teleop_action_processor = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
-            steps=[HaplyToCrispClutchProcessor(
-                teleop_mode=getattr(teleop_config, "teleop_mode", "left_arm_6DOF"),
-                translation_scale=getattr(teleop_config, "translation_scale", 1.0),
-                rotation_scale=getattr(teleop_config, "rotation_scale", 1.0),
-                max_gripper_width=getattr(teleop_config, "max_gripper_width", 0.08),
-            )],
+            steps=[
+                HaplyToCrispClutchProcessor(
+                    teleop_mode=getattr(teleop_config, "teleop_mode", "left_arm_6DOF"),
+                    translation_scale=getattr(teleop_config, "translation_scale", 1.0),
+                    rotation_scale=getattr(teleop_config, "rotation_scale", 1.0),
+                    max_gripper_width=getattr(teleop_config, "max_gripper_width", 0.08),
+                ),
+                AbsoluteToTwistProcessor(),
+            ],
             to_transition=robot_action_observation_to_transition,
             to_output=transition_to_robot_action,
         )
-        _, robot_action_processor, robot_observation_processor = make_default_processors()
+        robot_action_processor = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
+            steps=[TwistToAbsolutePoseProcessor()],
+            to_transition=robot_action_observation_to_transition,
+            to_output=transition_to_robot_action,
+        )
+        robot_observation_processor = make_default_robot_observation_processor()
         return teleop_action_processor, robot_action_processor, robot_observation_processor
 
-    elif teleop_type == "meta_quest" and robot_type == "crisp_fastapi":
-        from .crisp_fastapi_processors import DeltaPoseToAbsoluteProcessor
+    elif teleop_type == "meta_quest" and robot_type in crisp_robots:
+        from .crisp_fastapi_processors import (
+            AbsoluteToTwistProcessor,
+            DeltaPoseToAbsoluteProcessor,
+            TwistToAbsolutePoseProcessor,
+        )
 
         teleop_action_processor = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
-            steps=[DeltaPoseToAbsoluteProcessor()],
+            steps=[DeltaPoseToAbsoluteProcessor(), AbsoluteToTwistProcessor()],
             to_transition=robot_action_observation_to_transition,
             to_output=transition_to_robot_action,
         )
-        _, robot_action_processor, robot_observation_processor = make_default_processors()
+        robot_action_processor = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
+            steps=[TwistToAbsolutePoseProcessor()],
+            to_transition=robot_action_observation_to_transition,
+            to_output=transition_to_robot_action,
+        )
+        robot_observation_processor = make_default_robot_observation_processor()
         return teleop_action_processor, robot_action_processor, robot_observation_processor
 
     elif teleop_type == "haply" and robot_type == "slim_crisp":

@@ -74,6 +74,7 @@ from lerobot.robots import (  # noqa: F401
     RobotConfig,
     bi_so100_follower,
     crisp_fastapi,
+    crisp_ws,
     earthrover_mini_plus,
     hope_jr,
     koch_follower,
@@ -287,7 +288,7 @@ def teleoperate(cfg: TeleoperateConfig):
         if robot.name == "slim_crisp":
             logging.info("Moving robot to home position")
             robot._robot.home()
-        elif robot.name == "crisp_fastapi":
+        elif robot.name in ("crisp_fastapi", "crisp_ws"):
             logging.info("Moving robot to home position")
             robot.go_home()
 
