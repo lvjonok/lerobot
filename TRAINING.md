@@ -408,6 +408,25 @@ Mixed precision is handled automatically via `accelerator.autocast()`.
 
 This section covers training policies on real-world datasets collected with crisp_fastapi robots (Franka, Flexiv).
 
+## Dataset Observation Structure
+
+Real-world datasets use grouped observation columns instead of a single flat `observation.state` vector. Each group is a separate dataset column:
+
+| Column | Dims | Contents |
+|---|---|---|
+| `observation.state` | 8 | `tcp.pos`(3) + `tcp.quat`(4) + `gripper.pos`(1) |
+| `observation.effort` | 6 | `ft_sensor.force`(3) + `ft_sensor.torque`(3) |
+| `observation.joints` | 7 | `joint.pos`(7) |
+| `observation.joint_vel` | 7 | `joint.vel`(7) |
+
+All columns are mapped to `FeatureType.STATE` and loaded into the batch. However, each policy type uses different subsets:
+
+- **Diffusion Policy** — conditions the UNet on `observation.state` only (`robot_state_feature` matches exactly `observation.state`). Other columns are loaded but unused by the model.
+- **RDP Tokenizer** — the RNN decoder is conditioned per-step on columns listed in `temporal_cond_keys`. Typically `observation.effort` for force/torque reactivity.
+- **RDP Latent Diffusion** — the UNet conditions on `observation.state` (same as DP). The frozen AT decoder conditions on `at_temporal_cond_keys`.
+
+This grouping is supported by `hw_to_dataset_features()` in `datasets/utils.py`, which treats dict-valued entries in `observation_features` as named groups, each becoming a separate `observation.<group_name>` column.
+
 ## Training Diffusion Policy
 
 ```bash
@@ -427,6 +446,7 @@ python -m lerobot.scripts.lerobot_train \
 - **`down_dims`**: The UNet downsampling factor is `2^len(down_dims)`. The `horizon` must be divisible by this factor. Default `(512,1024,2048)` requires `horizon % 8 == 0`. Use `(256,512,1024)` for a smaller model.
 - **`crop_shape`**: Must use JSON array syntax: `'[84,84]'`. Python tuple syntax `'(84, 84)'` does not work with draccus CLI parsing.
 - **Feature mapping**: The dataset's `observation.state` is mapped to `STATE` features and camera images to `VISUAL` features automatically via `dataset_to_policy_features()`.
+- **State conditioning**: The UNet's `robot_state_feature` property matches only the column named exactly `observation.state` (8-dim: tcp + gripper). Other observation columns (`observation.effort`, `observation.joints`, `observation.joint_vel`) are present in `input_features` but are not read by the Diffusion model.
 
 ---
 
@@ -459,12 +479,12 @@ Draccus does not support Python tuple syntax in CLI arguments. Use JSON array sy
 
 ```bash
 # Correct:
---policy.temporal_cond_keys='[observation.state]'
+--policy.temporal_cond_keys='[observation.effort]'
 --policy.crop_shape='[84,84]'
 --policy.down_dims='[256,512,1024]'
 
 # WRONG (will fail):
---policy.temporal_cond_keys='("observation.state",)'
+--policy.temporal_cond_keys='("observation.effort",)'
 --policy.crop_shape='(84, 84)'
 ```
 
@@ -479,10 +499,12 @@ python -m lerobot.scripts.lerobot_train \
     --policy.push_to_hub=false \
     --dataset.repo_id=domrachev03/franka_timing_belt_haply \
     --policy.decoder_type=rnn \
-    --policy.temporal_cond_keys='[observation.state]' \
+    --policy.temporal_cond_keys='[observation.effort]' \
     --wandb.enable=true \
     --wandb.project=rdp_timing_belt
 ```
+
+The RNN decoder is conditioned per-step on `observation.effort` (force/torque), making the decoded actions reactive to contact forces. The encoder compresses action chunks without any observation input.
 
 ### Key configuration options
 
@@ -496,7 +518,7 @@ python -m lerobot.scripts.lerobot_train \
 | `decoder_hidden_dim` | 32 | Hidden dimension for decoder layers |
 | `use_vq` | `False` | Use Residual VQ instead of Gaussian VAE |
 | `n_embed` | 32 | Codebook size (VQ) or quant channel dim (VAE) |
-| `temporal_cond_keys` | `()` | Observation keys for RNN temporal conditioning (required when `decoder_type="rnn"`) |
+| `temporal_cond_keys` | `()` | Observation columns for RNN temporal conditioning (required when `decoder_type="rnn"`). Each entry must match a dataset column name (e.g. `observation.effort`). Multiple columns can be listed: `'[observation.effort,observation.state]'`. |
 | `kl_multiplier` | 1e-6 | KL divergence loss weight (Gaussian VAE mode) |
 | `vq_loss_multiplier` | 5.0 | VQ commitment loss weight (VQ mode) |
 | `act_scale` | 1.0 | Divisor applied to normalised actions before encoding |
@@ -533,10 +555,12 @@ python -m lerobot.scripts.lerobot_train \
     --dataset.repo_id=domrachev03/franka_timing_belt_haply \
     --policy.pretrained_tokenizer_path=outputs/train/<stage1_run>/checkpoints/last/pretrained_model \
     --policy.at_decoder_type=rnn \
-    --policy.at_temporal_cond_keys='[observation.state]' \
+    --policy.at_temporal_cond_keys='[observation.effort]' \
     --wandb.enable=true \
     --wandb.project=rdp_timing_belt
 ```
+
+The UNet conditions on `observation.state` (tcp + gripper) via the same `robot_state_feature` mechanism as standard DP. The frozen AT decoder uses `at_temporal_cond_keys` for per-step force/torque conditioning during action decoding.
 
 ### Key configuration options
 
@@ -596,7 +620,7 @@ python -m lerobot.scripts.lerobot_train \
     --dataset.repo_id=domrachev03/franka_timing_belt_haply \
     --policy.encoder_type=conv1d \
     --policy.decoder_type=rnn \
-    --policy.temporal_cond_keys='[observation.state]' \
+    --policy.temporal_cond_keys='[observation.effort]' \
     --policy.n_latent_dims=4 \
     --wandb.enable=true \
     --wandb.project=rdp_timing_belt
@@ -610,7 +634,7 @@ python -m lerobot.scripts.lerobot_train \
     --policy.pretrained_tokenizer_path=outputs/train/<stage1_run>/checkpoints/last/pretrained_model \
     --policy.at_encoder_type=conv1d \
     --policy.at_decoder_type=rnn \
-    --policy.at_temporal_cond_keys='[observation.state]' \
+    --policy.at_temporal_cond_keys='[observation.effort]' \
     --policy.at_n_latent_dims=4 \
     --policy.vision_backbone=resnet18 \
     --policy.num_train_timesteps=100 \

@@ -614,8 +614,36 @@ def _validate_feature_names(features: dict[str, dict]) -> None:
         raise ValueError(f"Feature names should not contain '/'. Found '/' in '{invalid_features}'.")
 
 
+def _build_scalar_spec(fts: dict[str, type | tuple]) -> dict:
+    """Build a float32 feature spec from a dict of scalar/1D features."""
+    feature_sizes = {}
+    for key, ftype in fts.items():
+        if ftype is float:
+            feature_sizes[key] = 1
+        elif isinstance(ftype, tuple) and len(ftype) == 1:
+            feature_sizes[key] = ftype[0]
+        elif isinstance(ftype, PolicyFeature):
+            feature_sizes[key] = 1
+        else:
+            feature_sizes[key] = 1
+    return {
+        "dtype": "float32",
+        "shape": (sum(feature_sizes.values()),),
+        "names": list(fts),
+        "feature_sizes": feature_sizes,
+    }
+
+
+def _is_scalar_feature(ftype) -> bool:
+    return (
+        ftype is float
+        or (isinstance(ftype, tuple) and len(ftype) == 1)
+        or (isinstance(ftype, PolicyFeature) and ftype.type != FeatureType.VISUAL)
+    )
+
+
 def hw_to_dataset_features(
-    hw_features: dict[str, type | tuple], prefix: str, use_video: bool = True
+    hw_features: dict[str, type | tuple | dict], prefix: str, use_video: bool = True
 ) -> dict[str, dict]:
     """Convert hardware-specific features to a LeRobot dataset feature dictionary.
 
@@ -623,52 +651,73 @@ def hw_to_dataset_features(
     or camera image shapes) and formats it into the standard LeRobot feature
     specification.
 
-    Args:
-        hw_features (dict): Dictionary mapping feature names to their type (float for
-            joints) or shape (tuple for images).
-        prefix (str): The prefix to add to the feature keys (e.g., "observation"
-            or "action").
-        use_video (bool): If True, image features are marked as "video", otherwise "image".
+    Features can be **grouped** by using dict values.  When a value in
+    ``hw_features`` is itself a dict, it is treated as a named group whose
+    inner keys follow the same scalar/image rules.  Each group becomes a
+    separate dataset column: ``{prefix}.{group_name}`` for observations or
+    ``{prefix}.{group_name}`` for actions.  Ungrouped scalar features still
+    go into the default column (``observation.state`` or ``action``).
 
-    Returns:
-        dict: A LeRobot features dictionary.
-    """
-    features = {}
-    joint_fts = {
-        key: ftype
-        for key, ftype in hw_features.items()
-        if ftype is float
-        or (isinstance(ftype, tuple) and len(ftype) == 1)
-        or (isinstance(ftype, PolicyFeature) and ftype.type != FeatureType.VISUAL)
-    }
-    cam_fts = {key: shape for key, shape in hw_features.items() if isinstance(shape, tuple) and len(shape) >= 2}
+    Example::
 
-    if joint_fts:
-        # Compute per-feature dimensions and total dimension
-        feature_sizes = {}
-        for key, ftype in joint_fts.items():
-            if ftype is float:
-                feature_sizes[key] = 1
-            elif isinstance(ftype, tuple) and len(ftype) == 1:
-                feature_sizes[key] = ftype[0]
-            elif isinstance(ftype, PolicyFeature):
-                feature_sizes[key] = 1
-            else:
-                feature_sizes[key] = 1
-        total_dim = sum(feature_sizes.values())
-
-        ft_spec = {
-            "dtype": "float32",
-            "shape": (total_dim,),
-            "names": list(joint_fts),
-            "feature_sizes": feature_sizes,
+        hw_features = {
+            "state": {                        # group → observation.state
+                "tcp.pos": (3,),
+                "gripper.pos": float,
+            },
+            "effort": {                       # group → observation.effort
+                "ft_sensor.force": (3,),
+                "ft_sensor.torque": (3,),
+            },
+            "camera_top": (480, 640, 3),      # image  → observation.images.camera_top
         }
 
+    Args:
+        hw_features: Dictionary mapping feature names to their type (``float``
+            for scalars), shape (tuple for arrays/images), or a **dict** for a
+            named feature group.
+        prefix: The prefix to add to the feature keys (e.g., ``"observation"``
+            or ``"action"``).
+        use_video: If True, image features are marked as ``"video"``, otherwise
+            ``"image"``.
+
+    Returns:
+        A LeRobot features dictionary.
+    """
+    features: dict[str, dict] = {}
+
+    # Separate into groups (dict values), ungrouped scalars, and cameras.
+    groups: dict[str, dict] = {}
+    flat_fts: dict[str, type | tuple] = {}
+    cam_fts: dict[str, tuple] = {}
+
+    for key, ftype in hw_features.items():
+        if isinstance(ftype, dict):
+            groups[key] = ftype
+        elif isinstance(ftype, tuple) and len(ftype) >= 2:
+            cam_fts[key] = ftype
+        elif _is_scalar_feature(ftype):
+            flat_fts[key] = ftype
+
+    # Named groups → one column each.
+    for group_name, group_features in groups.items():
+        group_scalars = {k: v for k, v in group_features.items() if _is_scalar_feature(v)}
+        if group_scalars:
+            ft_spec = _build_scalar_spec(group_scalars)
+            if prefix == ACTION:
+                features[f"{prefix}.{group_name}"] = ft_spec
+            elif prefix == OBS_STR:
+                features[f"{prefix}.{group_name}"] = ft_spec
+
+    # Ungrouped scalar features → default column (backward compatible).
+    if flat_fts:
+        ft_spec = _build_scalar_spec(flat_fts)
         if prefix == ACTION:
             features[prefix] = ft_spec
         elif prefix == OBS_STR:
             features[f"{prefix}.state"] = ft_spec
 
+    # Camera / image features.
     for key, shape in cam_fts.items():
         features[f"{prefix}.images.{key}"] = {
             "dtype": "video" if use_video else "image",

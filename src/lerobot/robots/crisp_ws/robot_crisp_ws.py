@@ -58,16 +58,29 @@ class CrispWSRobot(Robot):
 
     @cached_property
     def observation_features(self) -> dict:
+        """Dictionary describing observation structure.
+
+        Observations are split into named groups so that each group becomes a
+        separate dataset column (``observation.state``, ``observation.effort``,
+        etc.).  This allows policies to selectively include/exclude groups via
+        ``input_features``.
+        """
         features = {
-            "tcp.pos": (3,),
-            "tcp.quat": (4,),
-            "gripper.pos": float,
-            "wrench.force": (3,),
-            "wrench.torque": (3,),
-            "ft_sensor.force": (3,),
-            "ft_sensor.torque": (3,),
-            "joint.pos": (7,),
-            "joint.vel": (7,),
+            "state": {
+                "tcp.pos": (3,),
+                "tcp.quat": (4,),
+                "gripper.pos": float,
+            },
+            "effort": {
+                "ft_sensor.force": (3,),
+                "ft_sensor.torque": (3,),
+            },
+            "joints": {
+                "joint.pos": (7,),
+            },
+            "joint_vel": {
+                "joint.vel": (7,),
+            },
         }
         for cam_key, cam in self.cameras.items():
             if hasattr(cam, "height") and hasattr(cam, "width"):
@@ -215,10 +228,6 @@ class CrispWSRobot(Robot):
         gripper_state = data.get("gripper", [0, 0])
         gripper_pos = float(gripper_state[0])
 
-        wrench = data.get("wrench", [0, 0, 0, 0, 0, 0])
-        wrench_force = np.array(wrench[:3], dtype=np.float32)
-        wrench_torque = np.array(wrench[3:], dtype=np.float32)
-
         ft = data.get("ft_sensor", [0, 0, 0, 0, 0, 0])
         ft_force = np.array(ft[:3], dtype=np.float32)
         ft_torque = np.array(ft[3:], dtype=np.float32)
@@ -230,8 +239,6 @@ class CrispWSRobot(Robot):
             "tcp.pos": tcp_pos,
             "tcp.quat": tcp_quat,
             "gripper.pos": gripper_pos,
-            "wrench.force": wrench_force,
-            "wrench.torque": wrench_torque,
             "ft_sensor.force": ft_force,
             "ft_sensor.torque": ft_torque,
             "joint.pos": joint_pos,
