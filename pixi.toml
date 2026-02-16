@@ -17,6 +17,10 @@ setuptools = ">=71.0.0,<81"
 cmake = ">=3.29.0.1,<5"
 pkg-config = ">=0.29.2,<0.30"
 pip = ">=25.3,<26"
+ffmpeg = ">=6,<8"
+# Pre-built evdev from conda-forge — avoids PyPI source build that fails
+# due to missing kernel header macros in conda-forge sysroot
+evdev = ">=1.9,<2"
 
 [pypi-dependencies]
 # Install lerobot itself (editable) — pulls in all core deps from pyproject.toml
@@ -46,12 +50,16 @@ scipy = "*"
 rerun-sdk=">=0.24.0"
 
 [feature.cpu.pypi-dependencies]
-torch = { version = ">=2.2.1,<2.8", index = "https://download.pytorch.org/whl/cpu" }
-torchvision = { version = ">=0.21.0,<0.23", index = "https://download.pytorch.org/whl/cpu" }
+torch = { version = ">=2.2.1,<2.7", index = "https://download.pytorch.org/whl/cpu" }
+torchvision = { version = ">=0.21.0,<0.22", index = "https://download.pytorch.org/whl/cpu" }
+# torchcodec must come from the same pytorch index as torch to avoid ABI mismatch
+torchcodec = { version = ">=0.2,<0.3", index = "https://download.pytorch.org/whl/cpu" }
 
 [feature.cuda.pypi-dependencies]
-torch = { version = ">=2.2.1,<2.8", index = "https://download.pytorch.org/whl/cu124" }
-torchvision = { version = ">=0.21.0,<0.23", index = "https://download.pytorch.org/whl/cu124" }
+torch = { version = ">=2.2.1,<2.7", index = "https://download.pytorch.org/whl/cu124" }
+torchvision = { version = ">=0.21.0,<0.22", index = "https://download.pytorch.org/whl/cu124" }
+# torchcodec from CPU index — video decoding is CPU-only; cu124 build needs libnppicc
+torchcodec = { version = ">=0.2,<0.3", index = "https://download.pytorch.org/whl/cpu" }
 
 [environments]
 default = ["cpu"]
