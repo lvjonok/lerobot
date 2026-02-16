@@ -242,6 +242,12 @@ class RDPTokenizerPolicy(PreTrainedPolicy):
         self._queues = None
         self.reset()
 
+    def state_dict(self, *args, **kwargs):
+        # nn.GRU flattens weights into a shared cuDNN buffer on CUDA.
+        # Cloning breaks the shared storage so safetensors can save them.
+        sd = super().state_dict(*args, **kwargs)
+        return {k: v.clone() for k, v in sd.items()}
+
     def get_optim_params(self):
         return self.parameters()
 
