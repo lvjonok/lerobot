@@ -35,7 +35,16 @@ from PIL import Image
 
 def get_safe_default_codec():
     if importlib.util.find_spec("torchcodec"):
-        return "torchcodec"
+        try:
+            import torchcodec  # noqa: F401
+
+            return "torchcodec"
+        except (ImportError, RuntimeError):
+            logging.warning(
+                "'torchcodec' is installed but failed to load (likely ABI mismatch), "
+                "falling back to 'pyav' as a default decoder"
+            )
+            return "pyav"
     else:
         logging.warning(
             "'torchcodec' is not available in your platform, falling back to 'pyav' as a default decoder"
@@ -189,17 +198,14 @@ class VideoDecoderCache:
 
         with self._lock:
             if video_path not in self._cache:
-                file_handle = fsspec.open(video_path).__enter__()
-                decoder = VideoDecoder(file_handle, seek_mode="approximate")
-                self._cache[video_path] = (decoder, file_handle)
+                decoder = VideoDecoder(video_path, seek_mode="approximate")
+                self._cache[video_path] = decoder
 
-            return self._cache[video_path][0]
+            return self._cache[video_path]
 
     def clear(self):
-        """Clear the cache and close file handles."""
+        """Clear the cache."""
         with self._lock:
-            for _, file_handle in self._cache.values():
-                file_handle.close()
             self._cache.clear()
 
     def size(self) -> int:
