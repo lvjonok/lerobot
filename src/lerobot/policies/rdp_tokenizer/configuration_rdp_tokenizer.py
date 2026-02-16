@@ -115,7 +115,12 @@ class RDPTokenizerConfig(PreTrainedConfig):
             raise ValueError("RDP Tokenizer requires an 'action' output feature.")
 
     @property
-    def observation_delta_indices(self) -> list:
+    def observation_delta_indices(self) -> list | None:
+        # The tokenizer only needs observation keys declared in temporal_cond_keys
+        # (handled via observation_delta_indices_per_key). Returning None avoids
+        # loading unnecessary data like camera frames.
+        if self.decoder_type == "rnn" and len(self.temporal_cond_keys) > 0:
+            return None
         return list(range(1 - self.n_obs_steps, 1))
 
     @property

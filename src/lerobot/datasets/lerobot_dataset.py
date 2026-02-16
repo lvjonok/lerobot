@@ -563,6 +563,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         download_videos: bool = True,
         video_backend: str | None = None,
         batch_encoding_size: int = 1,
+        load_videos: bool = True,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -686,6 +687,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.revision = revision if revision else CODEBASE_VERSION
         self.video_backend = video_backend if video_backend else get_safe_default_codec()
         self.delta_indices = None
+        self.load_videos = load_videos
         self.batch_encoding_size = batch_encoding_size
         self.episodes_since_last_encoding = 0
 
@@ -1036,16 +1038,15 @@ class LeRobotDataset(torch.utils.data.Dataset):
             for key, val in query_result.items():
                 item[key] = val
 
-        if len(self.meta.video_keys) > 0:
+        if self.load_videos and len(self.meta.video_keys) > 0:
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
             video_frames = self._query_videos(query_timestamps, ep_idx)
             item = {**video_frames, **item}
 
-        if self.image_transforms is not None:
-            image_keys = self.meta.camera_keys
-            for cam in image_keys:
-                item[cam] = self.image_transforms(item[cam])
+            if self.image_transforms is not None:
+                for cam in self.meta.camera_keys:
+                    item[cam] = self.image_transforms(item[cam])
 
         # Add task as a string
         task_idx = item["task_index"].item()

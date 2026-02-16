@@ -34,6 +34,10 @@ class DatasetConfig:
     revision: str | None = None
     use_imagenet_stats: bool = True
     video_backend: str = field(default_factory=get_safe_default_codec)
+    # Set to False to skip decoding video frames (useful when the policy
+    # does not need images, e.g. rdp_tokenizer).  When None (default), the
+    # factory auto-detects based on policy delta_timestamps.
+    load_videos: bool | None = None
     streaming: bool = False
 
 

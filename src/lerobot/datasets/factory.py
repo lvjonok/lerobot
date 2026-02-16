@@ -93,6 +93,13 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
         delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+        # Explicit CLI flag takes priority; otherwise auto-detect from delta_timestamps
+        if cfg.dataset.load_videos is not None:
+            load_videos = cfg.dataset.load_videos
+        else:
+            load_videos = delta_timestamps is not None and any(
+                key in ds_meta.video_keys for key in delta_timestamps
+            )
         if not cfg.dataset.streaming:
             dataset = LeRobotDataset(
                 cfg.dataset.repo_id,
@@ -103,6 +110,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 revision=cfg.dataset.revision,
                 video_backend=cfg.dataset.video_backend,
                 tolerance_s=cfg.tolerance_s,
+                load_videos=load_videos,
             )
         else:
             dataset = StreamingLeRobotDataset(
