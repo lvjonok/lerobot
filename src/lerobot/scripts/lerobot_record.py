@@ -481,7 +481,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 robot_action_processor.reset()
 
                 input("Press Enter to start recording...")
-                log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
+                log_say(f"Recording episode {dataset.num_episodes} ({cfg.dataset.num_episodes - recorded_episodes} left)", cfg.play_sounds)
                 record_loop(
                     robot=robot,
                     events=events,
