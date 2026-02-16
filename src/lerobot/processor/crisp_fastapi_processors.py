@@ -1,6 +1,6 @@
-"""Processor steps for converting teleoperator deltas to absolute TCP commands.
+"""Processor steps for crisp_fastapi robots (any robot behind a crisp_py FastAPI server).
 
-Processor steps for crisp_fastapi robots (any robot behind a crisp_py FastAPI server):
+Action processors:
 
 1. SpaceMouseDeltaToAbsoluteProcessor — accumulates per-frame deltas from
    SpaceMouse (delta_pos, delta_rot in euler) into absolute TCP targets.
@@ -8,6 +8,11 @@ Processor steps for crisp_fastapi robots (any robot behind a crisp_py FastAPI se
 2. DeltaPoseToAbsoluteProcessor — applies delta position/quaternion from
    initial hand pose to initial robot pose. Used with Haply and
    Meta Quest teleoperators that output pose deltas.
+
+Observation processors:
+
+3. FTSensorBiasSubtractionProcessor — per-episode gravity bias subtraction
+   for external F/T sensor readings.
 """
 
 from dataclasses import dataclass, field
@@ -19,7 +24,85 @@ import scipy.spatial.transform as st
 from lerobot.configs.types import PipelineFeatureType
 
 from .core import RobotAction, TransitionKey
-from .pipeline import ProcessorStepRegistry, RobotActionProcessorStep
+from .pipeline import ObservationProcessorStep, ProcessorStepRegistry, RobotActionProcessorStep
+
+
+@ProcessorStepRegistry.register("ft_sensor_bias_subtraction")
+@dataclass
+class FTSensorBiasSubtractionProcessor(ObservationProcessorStep):
+    """Per-episode gravity bias subtraction for external F/T sensor readings.
+
+    The ATI F/T sensor has a gravity-induced bias (~-14 N on the z-axis of
+    force).  This processor estimates the bias from the first N frames of each
+    episode (while the robot is stationary at the home pose) and subtracts it
+    from all subsequent readings.
+
+    During calibration (frames 0..N-1) the running mean is subtracted so every
+    output frame is already bias-corrected — matching the behaviour of the
+    offline per-episode correction applied to existing datasets.
+
+    Call ``reset()`` between episodes so that a fresh bias is computed for each
+    episode.  The recording script does this automatically.
+    """
+
+    force_key: str = "ft_sensor.force"
+    torque_key: str = "ft_sensor.torque"
+    num_calibration_frames: int = 10
+
+    # Internal state (not constructor args)
+    _frame_count: int = field(default=0, init=False, repr=False)
+    _force_sum: Any = field(default=None, init=False, repr=False)
+    _torque_sum: Any = field(default=None, init=False, repr=False)
+    _force_bias: Any = field(default=None, init=False, repr=False)
+    _torque_bias: Any = field(default=None, init=False, repr=False)
+    _calibrated: bool = field(default=False, init=False, repr=False)
+
+    def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
+        if self.force_key not in observation or self.torque_key not in observation:
+            return observation
+
+        force = np.asarray(observation[self.force_key], dtype=np.float32)
+        torque = np.asarray(observation[self.torque_key], dtype=np.float32)
+
+        if not self._calibrated:
+            if self._force_sum is None:
+                self._force_sum = np.zeros_like(force)
+                self._torque_sum = np.zeros_like(torque)
+
+            self._force_sum += force
+            self._torque_sum += torque
+            self._frame_count += 1
+
+            # Running mean as current best estimate of bias
+            self._force_bias = self._force_sum / self._frame_count
+            self._torque_bias = self._torque_sum / self._frame_count
+
+            if self._frame_count >= self.num_calibration_frames:
+                self._calibrated = True
+
+        observation[self.force_key] = force - self._force_bias
+        observation[self.torque_key] = torque - self._torque_bias
+        return observation
+
+    def reset(self) -> None:
+        self._frame_count = 0
+        self._force_sum = None
+        self._torque_sum = None
+        self._force_bias = None
+        self._torque_bias = None
+        self._calibrated = False
+
+    def transform_features(
+        self, features: dict, in_key: str | None = None, out_key: str | None = None
+    ) -> dict:
+        return features
+
+    def get_config(self) -> dict:
+        return {
+            "force_key": self.force_key,
+            "torque_key": self.torque_key,
+            "num_calibration_frames": self.num_calibration_frames,
+        }
 
 
 @ProcessorStepRegistry.register("spacemouse_delta_to_absolute")

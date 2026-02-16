@@ -404,6 +404,32 @@ Mixed precision is handled automatically via `accelerator.autocast()`.
 
 ---
 
+# Training on Real-World Datasets
+
+This section covers training policies on real-world datasets collected with crisp_fastapi robots (Franka, Flexiv).
+
+## Training Diffusion Policy
+
+```bash
+python -m lerobot.scripts.lerobot_train \
+    --policy.type=diffusion \
+    --dataset.repo_id=domrachev03/franka_timing_belt_haply \
+    --policy.push_to_hub=false \
+    --policy.down_dims='[256,512,1024]' \
+    --policy.crop_shape='[84,84]' \
+    --wandb.enable=true \
+    --wandb.project=rdp_timing_belt
+```
+
+### Important notes
+
+- **`push_to_hub=false`**: Required when `repo_id` is not set. Otherwise validation fails.
+- **`down_dims`**: The UNet downsampling factor is `2^len(down_dims)`. The `horizon` must be divisible by this factor. Default `(512,1024,2048)` requires `horizon % 8 == 0`. Use `(256,512,1024)` for a smaller model.
+- **`crop_shape`**: Must use JSON array syntax: `'[84,84]'`. Python tuple syntax `'(84, 84)'` does not work with draccus CLI parsing.
+- **Feature mapping**: The dataset's `observation.state` is mapped to `STATE` features and camera images to `VISUAL` features automatically via `dataset_to_policy_features()`.
+
+---
+
 # Training Reactive Diffusion Policy (RDP) with LeRobot
 
 This guide covers training the two-stage Reactive Diffusion Policy (Xue et al., RSS 2025) using the LeRobot framework.
@@ -412,21 +438,50 @@ This guide covers training the two-stage Reactive Diffusion Policy (Xue et al., 
 
 RDP consists of two stages trained sequentially:
 
-1. **Asymmetric Tokenizer (AT)** (`rdp_tokenizer`) — a VAE/VQ-VAE that compresses action chunks into a low-dimensional latent space. The encoder is simple (MLP or Conv1D); the decoder is optionally an RNN conditioned on temporal observations (e.g. tactile/force data).
+1. **Asymmetric Tokenizer (AT)** (`rdp_tokenizer`) — a VAE/VQ-VAE that compresses action chunks into a low-dimensional latent space. The encoder is simple (MLP or Conv1D); the decoder is optionally an RNN conditioned on temporal observations (e.g. force/torque data).
 2. **Latent Diffusion Policy (LDP)** (`rdp_latent_diffusion`) — a conditional 1-D UNet diffusion model that operates in the latent action space of the frozen AT. It uses the same vision encoder architecture as the standard Diffusion Policy.
+
+### Plugin discovery
+
+RDP policies are not built into the LeRobot CLI's default policy choices. You **must** pass `--policy.discover_packages_path` to register them:
+
+```bash
+# For AT (Stage 1):
+--policy.discover_packages_path=lerobot.policies.rdp_tokenizer
+
+# For LDP (Stage 2):
+--policy.discover_packages_path=lerobot.policies.rdp_latent_diffusion
+```
+
+### CLI syntax for list/tuple fields
+
+Draccus does not support Python tuple syntax in CLI arguments. Use JSON array syntax instead:
+
+```bash
+# Correct:
+--policy.temporal_cond_keys='[observation.state]'
+--policy.crop_shape='[84,84]'
+--policy.down_dims='[256,512,1024]'
+
+# WRONG (will fail):
+--policy.temporal_cond_keys='("observation.state",)'
+--policy.crop_shape='(84, 84)'
+```
 
 ## Stage 1: Train the Asymmetric Tokenizer
 
 The AT learns to encode and decode action trajectories. It does not use image observations.
 
 ```bash
-lerobot-train \
-  --policy.type=rdp_tokenizer \
-  --dataset.repo_id=<user>/<dataset> \
-  --policy.horizon=32 \
-  --policy.encoder_type=conv1d \
-  --policy.decoder_type=rnn \
-  --policy.temporal_cond_keys='("observation.wrench",)'
+python -m lerobot.scripts.lerobot_train \
+    --policy.discover_packages_path=lerobot.policies.rdp_tokenizer \
+    --policy.type=rdp_tokenizer \
+    --policy.push_to_hub=false \
+    --dataset.repo_id=domrachev03/franka_timing_belt_haply \
+    --policy.decoder_type=rnn \
+    --policy.temporal_cond_keys='[observation.state]' \
+    --wandb.enable=true \
+    --wandb.project=rdp_timing_belt
 ```
 
 ### Key configuration options
@@ -434,7 +489,7 @@ lerobot-train \
 | Parameter | Default | Description |
 |---|---|---|
 | `horizon` | 32 | Length of the action chunk to encode/decode |
-| `encoder_type` | `"mlp"` | Encoder architecture: `"mlp"` or `"conv1d"` |
+| `encoder_type` | `"conv1d"` | Encoder architecture: `"mlp"` or `"conv1d"` |
 | `n_latent_dims` | 4 | Dimensionality of the latent code |
 | `encoder_hidden_dim` | 32 | Hidden dimension for encoder layers |
 | `decoder_type` | `"mlp"` | Decoder architecture: `"mlp"` or `"rnn"` |
@@ -454,25 +509,33 @@ lerobot-train \
 ### Decoder types
 
 - **`mlp`**: Standard MLP decoder. No temporal conditioning.
-- **`rnn`**: GRU-based decoder with temporal conditioning. Requires `temporal_cond_keys` to specify which observation features to use as step-by-step conditioning (e.g. force/torque readings, tactile data). This is the "asymmetric" part — the decoder has access to per-step observations that the encoder does not.
+- **`rnn`**: GRU-based decoder with temporal conditioning. Requires `temporal_cond_keys` to specify which observation features to use as step-by-step conditioning (e.g. force/torque readings, tactile data). This is the "asymmetric" part — the decoder has access to per-step observations that the encoder does not. When using RNN, the `observation_delta_indices` is automatically extended to cover the full horizon so that per-step conditioning data is available.
 
 ### Training output
 
-The trained AT checkpoint will be saved to the standard LeRobot output directory. Note the path — you will need it for Stage 2.
+The trained AT checkpoint will be saved to the standard LeRobot output directory:
+
+```
+outputs/train/<run_name>/checkpoints/<step>/pretrained_model/
+```
+
+Note this path — you will need it for Stage 2.
 
 ## Stage 2: Train the Latent Diffusion Policy
 
 The LDP requires a pre-trained AT checkpoint from Stage 1.
 
 ```bash
-lerobot-train \
-  --policy.type=rdp_latent_diffusion \
-  --dataset.repo_id=<user>/<dataset> \
-  --policy.pretrained_tokenizer_path=<path_to_at_checkpoint> \
-  --policy.horizon=32 \
-  --policy.at_encoder_type=conv1d \
-  --policy.at_decoder_type=rnn \
-  --policy.at_temporal_cond_keys='("observation.wrench",)'
+python -m lerobot.scripts.lerobot_train \
+    --policy.discover_packages_path=lerobot.policies.rdp_latent_diffusion \
+    --policy.type=rdp_latent_diffusion \
+    --policy.push_to_hub=false \
+    --dataset.repo_id=domrachev03/franka_timing_belt_haply \
+    --policy.pretrained_tokenizer_path=outputs/train/<stage1_run>/checkpoints/last/pretrained_model \
+    --policy.at_decoder_type=rnn \
+    --policy.at_temporal_cond_keys='[observation.state]' \
+    --wandb.enable=true \
+    --wandb.project=rdp_timing_belt
 ```
 
 ### Key configuration options
@@ -526,26 +589,33 @@ These **must match** the values used when training the AT in Stage 1.
 
 ```bash
 # Stage 1: Train the Asymmetric Tokenizer
-lerobot-train \
-  --policy.type=rdp_tokenizer \
-  --dataset.repo_id=domrachev03/franka_peg_insertion \
-  --policy.horizon=32 \
-  --policy.encoder_type=conv1d \
-  --policy.decoder_type=rnn \
-  --policy.temporal_cond_keys='("observation.wrench",)' \
-  --policy.n_latent_dims=4
+python -m lerobot.scripts.lerobot_train \
+    --policy.discover_packages_path=lerobot.policies.rdp_tokenizer \
+    --policy.type=rdp_tokenizer \
+    --policy.push_to_hub=false \
+    --dataset.repo_id=domrachev03/franka_timing_belt_haply \
+    --policy.encoder_type=conv1d \
+    --policy.decoder_type=rnn \
+    --policy.temporal_cond_keys='[observation.state]' \
+    --policy.n_latent_dims=4 \
+    --wandb.enable=true \
+    --wandb.project=rdp_timing_belt
 
 # Stage 2: Train the Latent Diffusion Policy (point to Stage 1 output)
-lerobot-train \
-  --policy.type=rdp_latent_diffusion \
-  --dataset.repo_id=domrachev03/franka_peg_insertion \
-  --policy.pretrained_tokenizer_path=outputs/<stage1_run>/pretrained_model \
-  --policy.at_encoder_type=conv1d \
-  --policy.at_decoder_type=rnn \
-  --policy.at_temporal_cond_keys='("observation.wrench",)' \
-  --policy.at_n_latent_dims=4 \
-  --policy.vision_backbone=resnet18 \
-  --policy.num_train_timesteps=100
+python -m lerobot.scripts.lerobot_train \
+    --policy.discover_packages_path=lerobot.policies.rdp_latent_diffusion \
+    --policy.type=rdp_latent_diffusion \
+    --policy.push_to_hub=false \
+    --dataset.repo_id=domrachev03/franka_timing_belt_haply \
+    --policy.pretrained_tokenizer_path=outputs/train/<stage1_run>/checkpoints/last/pretrained_model \
+    --policy.at_encoder_type=conv1d \
+    --policy.at_decoder_type=rnn \
+    --policy.at_temporal_cond_keys='[observation.state]' \
+    --policy.at_n_latent_dims=4 \
+    --policy.vision_backbone=resnet18 \
+    --policy.num_train_timesteps=100 \
+    --wandb.enable=true \
+    --wandb.project=rdp_timing_belt
 ```
 
 ## Reference

@@ -21,6 +21,7 @@ from .converters import (
     transition_to_robot_action,
 )
 from .core import RobotAction, RobotObservation
+from .crisp_fastapi_processors import FTSensorBiasSubtractionProcessor
 from .pipeline import IdentityProcessorStep, RobotProcessorPipeline
 
 
@@ -49,6 +50,19 @@ def make_default_robot_action_processor() -> RobotProcessorPipeline[
 def make_default_robot_observation_processor() -> RobotProcessorPipeline[RobotObservation, RobotObservation]:
     robot_observation_processor = RobotProcessorPipeline[RobotObservation, RobotObservation](
         steps=[IdentityProcessorStep()],
+        to_transition=observation_to_transition,
+        to_output=transition_to_observation,
+    )
+    return robot_observation_processor
+
+
+def make_crisp_robot_observation_processor() -> RobotProcessorPipeline[RobotObservation, RobotObservation]:
+    """Observation processor for crisp_fastapi / crisp_ws robots.
+
+    Includes per-episode FT sensor bias subtraction (gravity compensation).
+    """
+    robot_observation_processor = RobotProcessorPipeline[RobotObservation, RobotObservation](
+        steps=[FTSensorBiasSubtractionProcessor()],
         to_transition=observation_to_transition,
         to_output=transition_to_observation,
     )
@@ -96,7 +110,7 @@ def make_processors_for(
             to_transition=robot_action_observation_to_transition,
             to_output=transition_to_robot_action,
         )
-        robot_observation_processor = make_default_robot_observation_processor()
+        robot_observation_processor = make_crisp_robot_observation_processor()
         return teleop_action_processor, robot_action_processor, robot_observation_processor
 
     elif teleop_type == "haply" and robot_type in crisp_robots:
@@ -124,7 +138,7 @@ def make_processors_for(
             to_transition=robot_action_observation_to_transition,
             to_output=transition_to_robot_action,
         )
-        robot_observation_processor = make_default_robot_observation_processor()
+        robot_observation_processor = make_crisp_robot_observation_processor()
         return teleop_action_processor, robot_action_processor, robot_observation_processor
 
     elif teleop_type == "meta_quest" and robot_type in crisp_robots:
@@ -144,7 +158,7 @@ def make_processors_for(
             to_transition=robot_action_observation_to_transition,
             to_output=transition_to_robot_action,
         )
-        robot_observation_processor = make_default_robot_observation_processor()
+        robot_observation_processor = make_crisp_robot_observation_processor()
         return teleop_action_processor, robot_action_processor, robot_observation_processor
 
     elif teleop_type == "haply" and robot_type == "slim_crisp":
@@ -167,6 +181,12 @@ def make_processors_for(
             to_output=transition_to_robot_action,
         )
         _, robot_action_processor, robot_observation_processor = make_default_processors()
+        return teleop_action_processor, robot_action_processor, robot_observation_processor
+
+    elif robot_type in crisp_robots:
+        teleop_action_processor = make_default_teleop_action_processor()
+        robot_action_processor = make_default_robot_action_processor()
+        robot_observation_processor = make_crisp_robot_observation_processor()
         return teleop_action_processor, robot_action_processor, robot_observation_processor
 
     else:

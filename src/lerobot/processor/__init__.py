@@ -31,6 +31,7 @@ from .core import (
 from .delta_action_processor import MapDeltaActionToRobotActionStep, MapTensorToDeltaActionDictStep
 from .device_processor import DeviceProcessorStep
 from .factory import (
+    make_crisp_robot_observation_processor,
     make_default_processors,
     make_default_robot_action_processor,
     make_default_robot_observation_processor,
@@ -41,7 +42,7 @@ from .gym_action_processor import (
     Numpy2TorchActionProcessorStep,
     Torch2NumpyActionProcessorStep,
 )
-from .crisp_fastapi_processors import HaplyToCrispClutchProcessor
+from .crisp_fastapi_processors import FTSensorBiasSubtractionProcessor, HaplyToCrispClutchProcessor
 from .haply_clutch_processor import HaplyToSlimCrispClutchProcessor
 from .hil_processor import (
     AddTeleopActionAsComplimentaryDataStep,
@@ -91,6 +92,7 @@ __all__ = [
     "DoneProcessorStep",
     "EnvAction",
     "EnvTransition",
+    "FTSensorBiasSubtractionProcessor",
     "GripperPenaltyProcessorStep",
     "HaplyToCrispClutchProcessor",
     "HaplyToSlimCrispClutchProcessor",
@@ -100,6 +102,7 @@ __all__ = [
     "InfoProcessorStep",
     "InterventionActionProcessorStep",
     "JointVelocityProcessorStep",
+    "make_crisp_robot_observation_processor",
     "make_default_processors",
     "make_default_teleop_action_processor",
     "make_default_robot_action_processor",

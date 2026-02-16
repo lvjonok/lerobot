@@ -479,6 +479,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 # Reset processor state so they re-initialize from current (home) pose
                 teleop_action_processor.reset()
                 robot_action_processor.reset()
+                robot_observation_processor.reset()
 
                 input("Press Enter to start recording...")
                 log_say(f"Recording episode {dataset.num_episodes} ({cfg.dataset.num_episodes - recorded_episodes} left)", cfg.play_sounds)
