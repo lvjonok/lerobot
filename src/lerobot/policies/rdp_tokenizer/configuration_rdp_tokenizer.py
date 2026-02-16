@@ -116,6 +116,9 @@ class RDPTokenizerConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> list:
+        if self.decoder_type == "rnn" and len(self.temporal_cond_keys) > 0:
+            # RNN decoder needs per-step temporal conditioning for the full horizon
+            return list(range(1 - self.n_obs_steps, 1 - self.n_obs_steps + self.horizon))
         return list(range(1 - self.n_obs_steps, 1))
 
     @property
