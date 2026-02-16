@@ -102,6 +102,16 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         raise NotImplementedError
 
     @property
+    def observation_delta_indices_per_key(self) -> dict[str, list] | None:
+        """Per-key observation delta indices override.
+
+        When not None, keys present in this dict use their own delta indices
+        instead of the generic ``observation_delta_indices``.  Keys absent from
+        the dict still fall back to the generic property.
+        """
+        return None
+
+    @property
     @abc.abstractmethod
     def action_delta_indices(self) -> list | None:  # type: ignore[type-arg]    #TODO: No implementation
         raise NotImplementedError
