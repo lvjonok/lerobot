@@ -129,6 +129,12 @@ class RDPLatentDiffusionPolicy(PreTrainedPolicy):
 
         return at_policy
 
+    def state_dict(self, *args, **kwargs):
+        # The frozen AT contains an nn.GRU whose weights share a flattened
+        # cuDNN buffer.  Clone all tensors so safetensors can save them.
+        sd = super().state_dict(*args, **kwargs)
+        return {k: v.clone() for k, v in sd.items()}
+
     def get_optim_params(self):
         # Only train the diffusion model, not the frozen AT
         return self.diffusion.parameters()
