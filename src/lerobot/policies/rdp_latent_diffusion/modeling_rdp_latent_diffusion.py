@@ -149,6 +149,68 @@ class RDPLatentDiffusionPolicy(PreTrainedPolicy):
         if self.config.env_state_feature:
             self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
 
+    # ---- Latent statistics ----
+
+    @torch.no_grad()
+    def compute_latent_stats(self, dataset) -> None:
+        """Compute min/max of latent actions across the dataset.
+
+        This must be called before training so that latent actions are normalized
+        to [-1, 1] for the diffusion model.  Results are stored as registered
+        buffers and automatically persist in checkpoints.
+        """
+        if self.diffusion.latent_stats_computed:
+            logger.info("Latent stats already computed (loaded from checkpoint), skipping.")
+            return
+
+        logger.info("Computing latent action statistics over the dataset...")
+        device = next(self.parameters()).device
+        self.at.to(device)
+
+        # Fetch action stats for inline normalization
+        stats = dataset.meta.stats
+        action_min = torch.tensor(stats[ACTION]["min"], device=device, dtype=torch.float32)
+        action_max = torch.tensor(stats[ACTION]["max"], device=device, dtype=torch.float32)
+
+        dataloader = torch.utils.data.DataLoader(
+            dataset, batch_size=64, num_workers=4, shuffle=False, drop_last=False,
+        )
+
+        running_min = None
+        running_max = None
+        n_batches = 0
+
+        for batch in dataloader:
+            actions = batch[ACTION].to(device, dtype=torch.float32)
+
+            # Normalize actions to [-1, 1] using dataset stats (same as the
+            # preprocessor does during training)
+            denom = action_max - action_min
+            eps = 1e-8
+            denom = torch.where(denom == 0, torch.tensor(eps, device=device), denom)
+            actions = 2 * (actions - action_min) / denom - 1
+
+            latent = self.diffusion._encode_to_latent(actions, self.at, self.config)
+            batch_min = latent.flatten(0, 1).min(dim=0).values
+            batch_max = latent.flatten(0, 1).max(dim=0).values
+
+            if running_min is None:
+                running_min = batch_min
+                running_max = batch_max
+            else:
+                running_min = torch.min(running_min, batch_min)
+                running_max = torch.max(running_max, batch_max)
+            n_batches += 1
+
+        self.diffusion.latent_min.data.copy_(running_min)
+        self.diffusion.latent_max.data.copy_(running_max)
+        self.diffusion.latent_stats_computed = True
+
+        logger.info(
+            "Latent stats computed over %d batches: min=%s, max=%s",
+            n_batches, running_min.tolist(), running_max.tolist(),
+        )
+
     # ---- Inference ----
 
     @torch.no_grad()
@@ -240,6 +302,13 @@ class _LatentDiffusionModel(nn.Module):
             for module_list in self.unet.up_modules:
                 module_list[-1] = nn.Identity()
 
+        # --- Latent action normalization buffers ---
+        # These are populated by RDPLatentDiffusionPolicy.compute_latent_stats()
+        # before training begins.  Once computed they are saved/loaded via state_dict.
+        self.register_buffer("latent_min", torch.zeros(1))
+        self.register_buffer("latent_max", torch.ones(1))
+        self.register_buffer("_latent_stats_flag", torch.tensor(0, dtype=torch.bool))
+
         # --- Noise scheduler ---
         self.noise_scheduler = _make_noise_scheduler(
             config.noise_scheduler_type,
@@ -255,6 +324,28 @@ class _LatentDiffusionModel(nn.Module):
             self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
         else:
             self.num_inference_steps = config.num_inference_steps
+
+    @property
+    def latent_stats_computed(self) -> bool:
+        return bool(self._latent_stats_flag.item())
+
+    @latent_stats_computed.setter
+    def latent_stats_computed(self, value: bool):
+        self._latent_stats_flag.fill_(value)
+
+    # --- Latent normalization (MIN_MAX to [-1, 1]) ---
+
+    def normalize_latent(self, x: Tensor) -> Tensor:
+        """Map latent actions from [latent_min, latent_max] to [-1, 1]."""
+        denom = self.latent_max - self.latent_min
+        eps = 1e-8
+        denom = torch.where(denom == 0, torch.tensor(eps, device=x.device, dtype=x.dtype), denom)
+        return 2 * (x - self.latent_min) / denom - 1
+
+    def unnormalize_latent(self, x: Tensor) -> Tensor:
+        """Map latent actions from [-1, 1] back to [latent_min, latent_max]."""
+        denom = self.latent_max - self.latent_min
+        return (x + 1) / 2 * denom + self.latent_min
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
@@ -364,6 +455,8 @@ class _LatentDiffusionModel(nn.Module):
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
         global_cond = self._prepare_global_conditioning(batch)
         latent = self.conditional_sample(batch_size, global_cond=global_cond, noise=noise)
+        if self.latent_stats_computed:
+            latent = self.unnormalize_latent(latent)
         actions = self._decode_from_latent(latent, batch, at, config)
 
         # Extract the action window
@@ -383,9 +476,11 @@ class _LatentDiffusionModel(nn.Module):
 
         global_cond = self._prepare_global_conditioning(batch)
 
-        # Encode actions to latent
+        # Encode actions to latent and normalize to [-1, 1]
         with torch.no_grad():
             latent_actions = self._encode_to_latent(batch[ACTION], at, config)
+            if self.latent_stats_computed:
+                latent_actions = self.normalize_latent(latent_actions)
 
         # Forward diffusion
         eps = torch.randn(latent_actions.shape, device=latent_actions.device)

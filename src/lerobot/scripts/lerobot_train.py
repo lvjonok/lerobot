@@ -230,6 +230,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         rename_map=cfg.rename_map,
     )
 
+    # Compute latent action statistics if this policy needs them (e.g. RDP LDP)
+    if has_method(policy, "compute_latent_stats") and not cfg.resume:
+        policy.compute_latent_stats(dataset)
+
     # Wait for all processes to finish policy creation before continuing
     accelerator.wait_for_everyone()
 
