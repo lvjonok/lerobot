@@ -305,8 +305,8 @@ class _LatentDiffusionModel(nn.Module):
         # --- Latent action normalization buffers ---
         # These are populated by RDPLatentDiffusionPolicy.compute_latent_stats()
         # before training begins.  Once computed they are saved/loaded via state_dict.
-        self.register_buffer("latent_min", torch.zeros(1))
-        self.register_buffer("latent_max", torch.ones(1))
+        self.register_buffer("latent_min", torch.zeros(latent_action_dim))
+        self.register_buffer("latent_max", torch.ones(latent_action_dim))
         self.register_buffer("_latent_stats_flag", torch.tensor(0, dtype=torch.bool))
 
         # --- Noise scheduler ---
