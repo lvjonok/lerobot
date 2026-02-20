@@ -1,140 +1,54 @@
-# LeRobot Inference & Evaluation
+# Inference & Evaluation
 
-This document describes how to run trained policies for evaluation in simulation and on real robots.
+This document describes how to deploy trained policies on the real robot for evaluation.
 
-## Simulation Evaluation
+## Action Interpolation
 
-### Quick Start
-
-```bash
-python -m lerobot.scripts.lerobot_eval \
-    --policy.path=lerobot/diffusion_pusht \
-    --env.type=pusht \
-    --eval.n_episodes=50 \
-    --eval.batch_size=10 \
-    --policy.device=cuda
-```
-
-### EvalPipelineConfig
-
-```python
-@dataclass
-class EvalPipelineConfig:
-    env: EnvConfig                            # Environment configuration
-    eval: EvalConfig = EvalConfig()           # Evaluation settings
-    policy: PreTrainedConfig | None = None    # Policy (loaded via --policy.path)
-    output_dir: Path | None = None            # Auto-generated if None
-    job_name: str | None = None
-    seed: int | None = 1000
-    rename_map: dict[str, str] = {}           # Observation key renaming
-```
-
-### EvalConfig
-
-```python
-@dataclass
-class EvalConfig:
-    n_episodes: int = 50                      # Total episodes to evaluate
-    batch_size: int = 50                      # Parallel environments
-    use_async_envs: bool = False              # AsyncVectorEnv (multiprocessing)
-```
-
-### Evaluation Flow
-
-1. Create vectorized environments from config
-2. Load policy via `PreTrainedPolicy.from_pretrained()`
-3. Create preprocessor/postprocessor pipelines
-4. Run batched rollouts via `eval_policy()`
-5. Save results to `eval_info.json`
-
-### rollout()
-
-The core evaluation function runs a single batched rollout:
-
-```python
-def rollout(env, policy, preprocessor, postprocessor, seeds, ...):
-    policy.reset()
-    obs, info = env.reset()
-
-    while not all_done:
-        action = policy.select_action(preprocessor(obs))
-        action = postprocessor(action)
-        obs, reward, terminated, truncated, info = env.step(action)
-
-    return {"action": ..., "reward": ..., "success": ..., "done": ...}
-```
-
-Returns tensors of shape `(batch, timesteps, ...)` for all tracked quantities.
-
-### eval_policy()
-
-Runs multiple batched rollouts, collecting metrics and optional videos:
-
-```python
-def eval_policy(env, policy, n_episodes, max_episodes_rendered, videos_dir, ...):
-    # Run n_episodes // batch_size batches
-    # Render videos for first max_episodes_rendered episodes
-    # Aggregate metrics across all episodes
-    return {
-        "per_episode": [...],  # {episode_ix, sum_reward, max_reward, success, seed}
-        "aggregated": {
-            "avg_sum_reward": ...,
-            "avg_max_reward": ...,
-            "pc_success": ...,
-            "eval_s": ...,
-        },
-        "video_paths": [...],
-    }
-```
-
-### Available Simulation Environments
-
-| Type | Description | FPS | Max Steps |
-|---|---|---|---|
-| `pusht` | 2D pushing task | 10 | 300 |
-| `aloha` | Bimanual manipulation | 50 | 400 |
-| `libero` | Multi-task benchmark (10 suites) | 30 | varies |
-| `metaworld` | Multi-task benchmark (50 tasks) | 80 | 400 |
-
-### Multi-Task Evaluation
-
-For benchmarks like LIBERO with multiple suites and tasks:
+When a policy is trained at lower FPS than the robot's control rate (e.g. 10Hz policy on a 30Hz robot), **action interpolation** smooths the trajectory by dividing each twist action into sub-steps:
 
 ```bash
-python -m lerobot.scripts.lerobot_eval \
-    --policy.path=my_user/my_policy \
-    --env.type=libero \
-    --env.task=libero_10 \
-    --eval.n_episodes=50
+--action_interpolation_steps=3   # 10Hz policy x 3 = 30Hz robot commands
 ```
 
-`eval_policy_all()` evaluates across all tasks and aggregates results per suite and overall.
+How it works:
+1. The policy outputs a twist action (linear_vel + angular_vel) at 10Hz
+2. `divide_twist()` divides velocity components by N (keeping absolute targets like `gripper.pos` unchanged)
+3. N sub-steps are executed at `1 / (fps x N)` intervals, each fetching a fresh robot observation
+4. The `robot_action_processor` converts each divided twist to an absolute pose using the live observation
 
-## Real Robot Evaluation
+This is available in both `lerobot-record --policy` and `lerobot-replay`. See [REPLAY.md](REPLAY.md) for replay-specific details.
 
-LeRobot provides three approaches for real robot evaluation:
+**When to use:**
+- 10Hz Diffusion Policy on 30Hz robot: `--action_interpolation_steps=3`
+- 30Hz RDP on 30Hz robot: not needed (steps = 0)
 
-### 1. Policy-Based Recording (lerobot-record)
+## Policy-Based Recording (lerobot-record)
 
 Record policy rollouts as a dataset using `lerobot-record` with `--policy.path`. This reuses the recording infrastructure but uses a policy instead of a teleoperator.
 
 ```bash
 lerobot-record \
-    --robot.type=crisp_fastapi \
-    --robot.server_url=http://192.168.50.67:8092 \
-    --robot.cameras='{"external": {"type": "intelrealsense", "serial_number_or_name": "838212074376", "width": 640, "height": 480, "fps": 30}}' \
-    --policy.path=my_user/my_policy \
-    --dataset.repo_id=my_user/eval_dataset \
+    --robot.type=crisp_ws \
+    --robot.ws_url=ws://localhost:8092/ws \
+    --robot.max_gripper_width=0.078 \
+    --robot.gripper_velocity=0.15 \
+    --robot.gripper_force=20.0 \
+    --robot.cameras='{"external_camera": {"type": "intelrealsense", "serial_number_or_name": "838212074376", "width": 640, "height": 480, "fps": 30}, "left_wrist_camera": {"type": "intelrealsense", "serial_number_or_name": "130322271369", "width": 640, "height": 480, "fps": 30}}' \
+    --policy.path=outputs/train/.../checkpoints/last/pretrained_model \
+    --dataset.repo_id=domrachev03/eval_dataset \
     --dataset.single_task="Policy evaluation" \
     --dataset.num_episodes=10 \
-    --dataset.fps=30
+    --dataset.fps=30 \
+    --action_interpolation_steps=3
 ```
 
 The recording loop calls `policy.select_action()` instead of `teleop.get_action()` each step. The resulting dataset can be analyzed offline for success rate, trajectory quality, etc.
 
+When using `--action_interpolation_steps`, the policy runs at its native FPS (e.g. 10Hz) while the robot receives interpolated commands at the higher rate. Dataset frames are saved at the policy FPS.
+
 **Hybrid mode**: Provide both `--teleop` and `--policy` to use the policy for recording and the teleoperator for resetting the environment between episodes.
 
-### 2. Async Inference (Client-Server)
+## Async Inference (Client-Server)
 
 For real-time action chunking with latency management, use the async inference system:
 
@@ -151,17 +65,17 @@ python -m lerobot.async_inference.policy_server \
 
 ```bash
 python -m lerobot.async_inference.robot_client \
-    --robot.type=crisp_fastapi \
-    --robot.server_url=http://192.168.50.67:8092 \
+    --robot.type=crisp_ws \
+    --robot.ws_url=ws://localhost:8092/ws \
     --server_address=127.0.0.1:8080 \
     --policy_type=diffusion \
-    --pretrained_name_or_path=my_user/my_policy \
+    --pretrained_name_or_path=outputs/train/.../checkpoints/last/pretrained_model \
     --actions_per_chunk=8 \
     --fps=30 \
     --task="Pick and place"
 ```
 
-#### Action Chunking & Aggregation
+### Action Chunking & Aggregation
 
 The client maintains a queue of future actions. When a new action chunk arrives from the server and overlaps with queued actions, they are aggregated:
 
@@ -172,51 +86,19 @@ The client maintains a queue of future actions. When a new action chunk arrives 
 | `average` | 0.5 * old + 0.5 * new | Equal weighting |
 | `conservative` | 0.7 * old + 0.3 * new | Stable, slow adaptation |
 
-#### Client-Server Protocol (gRPC)
+### Client-Server Protocol (gRPC)
 
 1. **`Ready()`** — client handshake, resets server state
 2. **`SendPolicyInstructions()`** — client sends policy type, path, device; server loads policy
 3. **`SendObservations()`** — client streams observations to server
 4. **`GetActions()`** — server runs inference, returns timestamped action chunk
 
-### 3. Custom Gym Environment
-
-Wrap the robot as a Gym environment and use `lerobot-eval` directly:
-
-```python
-import gymnasium as gym
-
-class FrankaRealEnv(gym.Env):
-    def __init__(self, robot):
-        self.robot = robot
-
-    def reset(self, seed=None):
-        self.robot.go_home()
-        obs = self.robot.get_observation()
-        return obs, {}
-
-    def step(self, action):
-        self.robot.send_action(action)
-        obs = self.robot.get_observation()
-        reward = self.compute_reward(obs)
-        terminated = self.check_success(obs)
-        return obs, reward, terminated, False, {}
-```
-
 ## Policy Loading
-
-### From HuggingFace Hub
-
-```python
-from lerobot.policies.pretrained import PreTrainedPolicy
-policy = PreTrainedPolicy.from_pretrained("lerobot/diffusion_pusht", device="cuda")
-```
-
-Or via CLI: `--policy.path=lerobot/diffusion_pusht`
 
 ### From Local Checkpoint
 
 ```python
+from lerobot.policies.pretrained import PreTrainedPolicy
 policy = PreTrainedPolicy.from_pretrained(
     "outputs/train/.../checkpoints/last/pretrained_model",
     device="cuda"
@@ -224,6 +106,14 @@ policy = PreTrainedPolicy.from_pretrained(
 ```
 
 Or via CLI: `--policy.path=outputs/train/.../checkpoints/last/pretrained_model`
+
+### From HuggingFace Hub
+
+```python
+policy = PreTrainedPolicy.from_pretrained("domrachev03/my_policy", device="cuda")
+```
+
+Or via CLI: `--policy.path=domrachev03/my_policy`
 
 ### Loading Process
 
@@ -239,7 +129,7 @@ Or via CLI: `--policy.path=outputs/train/.../checkpoints/last/pretrained_model`
 The same processor pipelines used in training are loaded for inference:
 
 ```
-Observation → Preprocessor → Policy → Postprocessor → Action
+Observation -> Preprocessor -> Policy -> Postprocessor -> Action
 ```
 
 Processors are loaded from the pretrained model directory:
@@ -251,45 +141,8 @@ Key inference-specific processing:
 - **`UnnormalizerProcessorStep`** — unnormalize predicted actions
 - **`DeviceProcessorStep`** — move tensors to/from GPU
 
-## Metrics & Output
+## See Also
 
-### Per-Episode Metrics
-
-| Metric | Description |
-|---|---|
-| `sum_reward` | Sum of rewards over the episode |
-| `max_reward` | Maximum single-step reward |
-| `success` | Whether the episode succeeded |
-| `seed` | Random seed used |
-
-### Aggregated Metrics
-
-| Metric | Description |
-|---|---|
-| `avg_sum_reward` | Mean sum reward across all episodes |
-| `avg_max_reward` | Mean max reward |
-| `pc_success` | Success percentage |
-| `eval_s` | Total evaluation wall time |
-| `eval_ep_s` | Average time per episode |
-
-### Output Files
-
-```
-output_dir/
-  eval_info.json              # All metrics (per-episode + aggregated)
-  videos/
-    eval_episode_0.mp4        # Rendered evaluation videos
-    eval_episode_1.mp4
-```
-
-## Sim vs Real Comparison
-
-| Aspect | Simulation | Real Robot |
-|---|---|---|
-| Environment | Gym VectorEnv | Physical robot + sensors |
-| Parallelism | Batched (batch_size envs) | Typically single |
-| Termination | `terminated \| truncated` | Manual or success detector |
-| Observation | Simulated sensors | Real cameras + proprioception |
-| Action exec | Instant (`env.step()`) | Async (HTTP/gRPC to robot server) |
-| Video | `env.render()` | Camera capture |
-| Evaluation | `lerobot-eval` | `lerobot-record --policy` or async inference |
+- [REPLAY.md](REPLAY.md) — Replaying recorded dataset trajectories on the real robot
+- [TRAINING.md](TRAINING.md) — Training policies on real-world datasets
+- [TELEOPERATION.md](TELEOPERATION.md) — Recording datasets with teleoperation

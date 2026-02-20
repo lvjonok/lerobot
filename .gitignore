@@ -179,3 +179,5 @@ outputs/
 *.urdf
 *.xml
 *.part
+outputs
+outputs_server

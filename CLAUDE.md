@@ -34,9 +34,10 @@ Python version: 3.10+ (3.11 when used with parent pixi, pinned by ROS2 Jazzy).
 
 ## Operational Guides
 
-- **[TELEOPERATION.md](TELEOPERATION.md)** — Teleoperation, recording, robot/teleoperator interfaces, custom plugin guide
-- **[TRAINING.md](TRAINING.md)** — Training configuration, training loop, RDP two-stage training, checkpoints
-- **[INFERENCE.md](INFERENCE.md)** — Simulation evaluation, real robot inference, async inference
+- **[TELEOPERATION.md](TELEOPERATION.md)** — Teleoperation, dataset recording, hardware plugins
+- **[TRAINING.md](TRAINING.md)** — Training Diffusion Policy and RDP (dataset FPS, downsampling, two-stage training, checkpoints)
+- **[REPLAY.md](REPLAY.md)** — Replaying recorded trajectories on the real robot, action interpolation
+- **[INFERENCE.md](INFERENCE.md)** — Real robot policy evaluation, async inference, action interpolation
 
 ## Running Tests
 

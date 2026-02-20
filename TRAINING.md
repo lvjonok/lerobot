@@ -1,22 +1,35 @@
-# LeRobot Training
+# Training
 
-This document describes how training works in LeRobot, including configuration, dataset format, training loop, and checkpointing.
+This document covers training policies on real-world datasets collected with crisp_fastapi robots (Franka, Flexiv), including standard Diffusion Policy and the two-stage Reactive Diffusion Policy (RDP).
 
 ## Quick Start
 
 ```bash
-# Train diffusion policy on pusht dataset
+# Train Diffusion Policy on 10Hz Franka dataset
 python -m lerobot.scripts.lerobot_train \
-    --policy.path=lerobot/diffusion_pusht \
-    --dataset.repo_id=lerobot/pusht \
-    --batch_size=64 \
-    --steps=100000
+    --policy.type=diffusion \
+    --dataset.repo_id=domrachev03/franka_timing_belt_haply_static_v3_10hz \
+    --policy.push_to_hub=false \
+    --policy.crop_shape='[480,640]' \
+    --num_epochs=600 \
+    --wandb.enable=true \
+    --wandb.project=rdp_timing_belt
 
 # Resume training from checkpoint
 python -m lerobot.scripts.lerobot_train \
     --config_path=outputs/train/.../checkpoints/last/pretrained_model/train_config.json \
     --resume=true
 ```
+
+### Epoch-based training
+
+LeRobot's training loop is step-based. If you prefer to specify the number of epochs instead, use `--num_epochs`:
+
+```bash
+--num_epochs=600
+```
+
+This overrides `steps` with `num_epochs * ceil(dataset_size / effective_batch_size)`, where `effective_batch_size = batch_size * num_gpu_processes`. The computed value is logged at startup.
 
 ## Configuration
 
@@ -30,7 +43,6 @@ class TrainPipelineConfig(HubMixin):
     # Core
     dataset: DatasetConfig                    # Dataset configuration
     policy: PreTrainedConfig | None = None    # Policy configuration
-    env: EnvConfig | None = None              # Optional sim environment (for evaluation)
 
     # Training
     output_dir: Path | None = None            # Auto-generated if None
@@ -42,9 +54,9 @@ class TrainPipelineConfig(HubMixin):
     batch_size: int = 8
     num_workers: int = 4
     steps: int = 100_000
+    num_epochs: int | None = None             # If set, overrides steps
 
     # Frequencies
-    eval_freq: int = 20_000                   # Evaluation frequency
     log_freq: int = 200                       # Logging frequency
     save_freq: int = 20_000                   # Checkpoint frequency
 
@@ -54,7 +66,6 @@ class TrainPipelineConfig(HubMixin):
     scheduler: LRSchedulerConfig | None = None
 
     # Integrations
-    eval: EvalConfig = EvalConfig()
     wandb: WandBConfig = WandBConfig()
 
     # Observation renaming
@@ -72,7 +83,6 @@ class DatasetConfig:
     revision: str | None = None               # Git revision/tag
     use_imagenet_stats: bool = True            # Use ImageNet normalization for images
     video_backend: str = "torchcodec"         # Video decoder backend
-    streaming: bool = False                   # Stream from Hub
     image_transforms: ImageTransformsConfig = ImageTransformsConfig()
 ```
 
@@ -90,239 +100,364 @@ class WandBConfig:
     disable_artifact: bool = False
 ```
 
-## CLI Usage
+### CLI syntax for list/tuple fields
 
-### Override any config field via CLI
-
-```bash
-python -m lerobot.scripts.lerobot_train \
-    --policy.path=lerobot/diffusion_pusht \
-    --dataset.repo_id=lerobot/pusht \
-    --policy.n_obs_steps=3 \
-    --policy.horizon=32 \
-    --optimizer.lr=5e-4 \
-    --scheduler.num_warmup_steps=1000 \
-    --wandb.enable=true \
-    --wandb.project=my_project
-```
-
-### Load pretrained policy and fine-tune
+Draccus does not support Python tuple syntax in CLI arguments. Use JSON array syntax:
 
 ```bash
-python -m lerobot.scripts.lerobot_train \
-    --policy.path=lerobot/diffusion_pusht \
-    --dataset.repo_id=my_user/my_dataset \
-    --steps=50000
+# Correct:
+--policy.crop_shape='[480,640]'
+--policy.down_dims='[256,512,1024]'
+--policy.temporal_cond_keys='[observation.effort]'
+
+# WRONG (will fail):
+--policy.crop_shape='(480, 640)'
 ```
 
-### Create policy from scratch
+## Dataset Observation Structure
+
+Real-world datasets use grouped observation columns instead of a single flat `observation.state` vector. Each group is a separate dataset column:
+
+| Column | Dims | Contents |
+|---|---|---|
+| `observation.state` | 8 | `tcp.pos`(3) + `tcp.quat`(4) + `gripper.pos`(1) |
+| `observation.effort` | 6 | `ft_sensor.force`(3) + `ft_sensor.torque`(3) |
+| `observation.joints` | 7 | `joint.pos`(7) |
+| `observation.joint_vel` | 7 | `joint.vel`(7) |
+
+All columns are mapped to `FeatureType.STATE` and loaded into the batch. However, each policy type uses different subsets:
+
+- **Diffusion Policy** — conditions the UNet on `observation.state` only (`robot_state_feature` matches exactly `observation.state`). Other columns are loaded but unused by the model.
+- **RDP Tokenizer** — the RNN decoder is conditioned per-step on columns listed in `temporal_cond_keys`. Typically `observation.effort` for force/torque reactivity.
+- **RDP Latent Diffusion** — the UNet conditions on `observation.state` (same as DP). The frozen AT decoder conditions on `at_temporal_cond_keys`.
+
+This grouping is supported by `hw_to_dataset_features()` in `datasets/utils.py`, which treats dict-valued entries in `observation_features` as named groups, each becoming a separate `observation.<group_name>` column.
+
+## Dataset FPS Guidelines
+
+Different policies work best at different frame rates. Datasets recorded at 30Hz (the default for `crisp_fastapi` recording configs) should be **downsampled** for standard Diffusion Policy:
+
+| Policy | Recommended FPS | Reason |
+|---|---|---|
+| **Diffusion Policy** | 10 Hz | Lower FPS = longer planning horizon in fewer steps |
+| **RDP (AT + LDP)** | 30 Hz | Needs high-frequency force/torque conditioning for reactivity |
+
+Use the downsample script to create a 10Hz variant:
+
+```bash
+python -m lerobot.scripts.lerobot_downsample_dataset \
+    --repo-id domrachev03/franka_timing_belt_haply_static_v3 \
+    --target-fps 10 \
+    --action-absolute-subfeatures gripper.pos
+```
+
+This creates a `*_10hz` dataset. Velocity action dims (`linear_vel`, `angular_vel`) are summed over each window to preserve total displacement. Absolute dims (`gripper.pos`) take the last value in each window.
+
+**Important:** The target FPS must evenly divide the source FPS (e.g. 30 / 10 = 3).
+
+When running a 10Hz policy on a 30Hz robot, use **action interpolation** to smooth the trajectory (see [REPLAY.md](REPLAY.md) and [INFERENCE.md](INFERENCE.md)).
+
+## Training Diffusion Policy
 
 ```bash
 python -m lerobot.scripts.lerobot_train \
     --policy.type=diffusion \
-    --policy.n_obs_steps=2 \
+    --dataset.repo_id=domrachev03/franka_timing_belt_haply_static_v3_10hz \
+    --policy.push_to_hub=false \
+    --policy.down_dims='[256,512,1024]' \
+    --policy.crop_shape='[480,640]' \
+    --num_epochs=600 \
+    --wandb.enable=true \
+    --wandb.project=rdp_timing_belt
+```
+
+### Important notes
+
+- **`push_to_hub=false`**: Required when `repo_id` is not set. Otherwise validation fails.
+- **`down_dims`**: The UNet downsampling factor is `2^len(down_dims)`. The `horizon` must be divisible by this factor. Default `(512,1024,2048)` requires `horizon % 8 == 0`. Use `(256,512,1024)` for a smaller model.
+- **`crop_shape`**: Set to match camera resolution from the recording config. For 640x480 cameras (see `configs/record/franka_haply.yaml`), use `'[480,640]'` (H, W) to train on full-size images.
+- **Dataset FPS**: Use a 10Hz downsampled dataset for DP (see above). The 30Hz dataset is for RDP.
+- **Feature mapping**: The dataset's `observation.state` is mapped to `STATE` features and camera images to `VISUAL` features automatically via `dataset_to_policy_features()`.
+- **State conditioning**: The UNet's `robot_state_feature` property matches only the column named exactly `observation.state` (8-dim: tcp + gripper). Other observation columns (`observation.effort`, `observation.joints`, `observation.joint_vel`) are present in `input_features` but are not read by the Diffusion model.
+
+---
+
+# Training Reactive Diffusion Policy (RDP)
+
+This section covers training the two-stage Reactive Diffusion Policy (Xue et al., RSS 2025) using the LeRobot framework.
+
+## Overview
+
+RDP consists of two stages trained sequentially:
+
+1. **Asymmetric Tokenizer (AT)** (`rdp_tokenizer`) — a VAE/VQ-VAE that compresses action chunks into a low-dimensional latent space. The encoder is simple (MLP or Conv1D); the decoder is optionally an RNN conditioned on temporal observations (e.g. force/torque data).
+2. **Latent Diffusion Policy (LDP)** (`rdp_latent_diffusion`) — a conditional 1-D UNet diffusion model that operates in the latent action space of the frozen AT. It uses the same vision encoder architecture as the standard Diffusion Policy.
+
+### Plugin discovery
+
+RDP policies are not built into the LeRobot CLI's default policy choices. You **must** pass `--policy.discover_packages_path` to register them:
+
+```bash
+# For AT (Stage 1):
+--policy.discover_packages_path=lerobot.policies.rdp_tokenizer
+
+# For LDP (Stage 2):
+--policy.discover_packages_path=lerobot.policies.rdp_latent_diffusion
+```
+
+## Stage 1: Train the Asymmetric Tokenizer
+
+The AT learns to encode and decode action trajectories. It does not use image observations.
+
+```bash
+python -m lerobot.scripts.lerobot_train \
+    --policy.discover_packages_path=lerobot.policies.rdp_tokenizer \
+    --policy.type=rdp_tokenizer \
+    --policy.push_to_hub=false \
+    --dataset.repo_id=domrachev03/franka_timing_belt_haply_static_v3 \
+    --policy.decoder_type=rnn \
+    --policy.temporal_cond_keys='[observation.effort]' \
+    --num_epochs=601 \
+    --wandb.enable=true \
+    --wandb.project=rdp_timing_belt
+```
+
+The RNN decoder is conditioned per-step on `observation.effort` (force/torque), making the decoded actions reactive to contact forces. The encoder compresses action chunks without any observation input.
+
+### Key configuration options
+
+| Parameter | Default | Description |
+|---|---|---|
+| `horizon` | 32 | Length of the action chunk to encode/decode |
+| `encoder_type` | `"conv1d"` | Encoder architecture: `"mlp"` or `"conv1d"` |
+| `n_latent_dims` | 4 | Dimensionality of the latent code |
+| `encoder_hidden_dim` | 32 | Hidden dimension for encoder layers |
+| `decoder_type` | `"mlp"` | Decoder architecture: `"mlp"` or `"rnn"` |
+| `decoder_hidden_dim` | 32 | Hidden dimension for decoder layers |
+| `use_vq` | `False` | Use Residual VQ instead of Gaussian VAE |
+| `n_embed` | 32 | Codebook size (VQ) or quant channel dim (VAE) |
+| `temporal_cond_keys` | `()` | Observation columns for RNN temporal conditioning (required when `decoder_type="rnn"`). Each entry must match a dataset column name (e.g. `observation.effort`). Multiple columns can be listed: `'[observation.effort,observation.state]'`. |
+| `kl_multiplier` | 1e-6 | KL divergence loss weight (Gaussian VAE mode) |
+| `vq_loss_multiplier` | 5.0 | VQ commitment loss weight (VQ mode) |
+| `act_scale` | 1.0 | Divisor applied to normalised actions before encoding |
+
+### Encoder types
+
+- **`mlp`**: Flattens the action chunk and processes with an MLP. Latent is a single vector.
+- **`conv1d`**: Uses 1-D convolutions with stride-2 downsampling. Latent is a sequence shorter than the input, which the LDP diffuses over as a 1-D trajectory.
+
+### Decoder types
+
+- **`mlp`**: Standard MLP decoder. No temporal conditioning.
+- **`rnn`**: GRU-based decoder with temporal conditioning. Requires `temporal_cond_keys` to specify which observation features to use as step-by-step conditioning (e.g. force/torque readings, tactile data). This is the "asymmetric" part — the decoder has access to per-step observations that the encoder does not. When using RNN, the `observation_delta_indices` is automatically extended to cover the full horizon so that per-step conditioning data is available.
+
+### Training metrics
+
+The AT logs the following metrics to wandb. The table below shows the mapping to the original RDP codebase metric names:
+
+| LeRobot metric | Original RDP metric | Formula | Description |
+|---|---|---|---|
+| `loss` | `train_loss` | `recon_l1 * encoder_loss_multiplier + regularization` | Total weighted loss (used for backprop) |
+| `recon_l1` | `train_encoder_loss` | `\|state - dec_out\|_1` | L1 reconstruction loss |
+| `recon_mse` | `train_vae_recon_loss` | `MSE(state, dec_out)` | MSE reconstruction (logged only, not backpropped) |
+| `kl_loss` | `train_kl_loss` | `posterior.kl().mean()` | KL divergence (Gaussian VAE mode) |
+| `vq_loss` | `train_vq_loss_state` | VQ commitment loss | VQ commitment loss (VQ mode) |
+
+The total loss formula:
+- **Gaussian VAE**: `loss = recon_l1 * encoder_loss_multiplier + kl_loss * kl_multiplier`
+- **VQ-VAE**: `loss = recon_l1 * encoder_loss_multiplier + vq_loss * vq_loss_multiplier`
+
+### Training output
+
+The trained AT checkpoint will be saved to the standard LeRobot output directory:
+
+```
+outputs/train/<run_name>/checkpoints/<step>/pretrained_model/
+```
+
+Note this path — you will need it for Stage 2.
+
+## Stage 2: Train the Latent Diffusion Policy
+
+The LDP requires a pre-trained AT checkpoint from Stage 1.
+
+```bash
+python -m lerobot.scripts.lerobot_train \
+    --policy.discover_packages_path=lerobot.policies.rdp_latent_diffusion \
+    --policy.type=rdp_latent_diffusion \
+    --policy.push_to_hub=false \
+    --dataset.repo_id=domrachev03/franka_timing_belt_haply_static_v3 \
+    --policy.pretrained_tokenizer_path=outputs/train/<stage1_run>/checkpoints/last/pretrained_model \
+    --policy.at_decoder_type=rnn \
+    --policy.at_temporal_cond_keys='[observation.effort]' \
+    --policy.crop_shape='[480,640]' \
+    --num_epochs=401 \
+    --wandb.enable=true \
+    --wandb.project=rdp_timing_belt
+```
+
+The UNet conditions on `observation.state` (tcp + gripper) via the same `robot_state_feature` mechanism as standard DP. The frozen AT decoder uses `at_temporal_cond_keys` for per-step force/torque conditioning during action decoding.
+
+### Latent action normalization
+
+Before training begins, the LDP automatically computes min/max statistics over the latent action space by encoding the full dataset through the frozen AT. Latent actions are then normalized to [-1, 1] (MIN_MAX) before being passed to the diffusion model, matching the original RDP implementation.
+
+This happens automatically on fresh training. On resume, stats are loaded from the checkpoint. The computed statistics are logged at startup:
+
+```
+Latent stats computed over N batches: min=[...], max=[...]
+```
+
+### Key configuration options
+
+| Parameter | Default | Description |
+|---|---|---|
+| `pretrained_tokenizer_path` | `None` | Path to trained AT checkpoint (required) |
+| `use_latent_action_before_vq` | `False` | Diffuse on pre-quantisation latent (only relevant when AT uses VQ) |
+| `vision_backbone` | `"resnet18"` | Vision encoder backbone |
+| `crop_shape` | `(84, 84)` | Crop size for image augmentation. Set to camera resolution `(480, 640)` for full-size images |
+| `down_dims` | `(512, 1024, 2048)` | UNet channel dimensions |
+| `noise_scheduler_type` | `"DDIM"` | Noise scheduler: `"DDIM"` or `"DDPM"` |
+| `num_train_timesteps` | 100 | Number of diffusion timesteps |
+| `num_inference_steps` | `None` | Inference steps (defaults to `num_train_timesteps`) |
+| `prediction_type` | `"epsilon"` | What the UNet predicts: `"epsilon"` or `"sample"` |
+
+### AT architecture parameters
+
+The LDP config duplicates the AT architecture parameters with an `at_` prefix so that the AT can be reconstructed at load time without the original config:
+
+| Parameter | Default | Mirrors AT |
+|---|---|---|
+| `at_encoder_type` | `"conv1d"` | `encoder_type` |
+| `at_n_latent_dims` | 4 | `n_latent_dims` |
+| `at_encoder_hidden_dim` | 32 | `encoder_hidden_dim` |
+| `at_encoder_n_layers` | 1 | `encoder_n_layers` |
+| `at_decoder_type` | `"rnn"` | `decoder_type` |
+| `at_decoder_hidden_dim` | 32 | `decoder_hidden_dim` |
+| `at_decoder_n_layers` | 1 | `decoder_n_layers` |
+| `at_use_vq` | `False` | `use_vq` |
+| `at_n_embed` | 32 | `n_embed` |
+| `at_vqvae_groups` | 4 | `vqvae_groups` |
+| `at_act_scale` | 1.0 | `act_scale` |
+| `at_temporal_cond_keys` | `()` | `temporal_cond_keys` |
+
+These **must match** the values used when training the AT in Stage 1.
+
+### What happens during training
+
+1. (Once, before training) Latent action min/max statistics are computed over the full dataset.
+2. Actions from the dataset are encoded to latent space using the frozen AT encoder + quantization.
+3. Latent actions are normalized to [-1, 1] using the precomputed statistics.
+4. The UNet learns to denoise these normalized latent actions, conditioned on image and state observations.
+5. The AT is never updated — only the vision encoder and UNet are trained.
+
+### What happens during inference
+
+1. The vision encoder + UNet produce a denoised latent action (in [-1, 1] normalized space).
+2. The latent is unnormalized back to the original latent scale.
+3. The frozen AT decoder converts the latent back to the original action space.
+4. If the AT uses an RNN decoder, temporal conditioning from the current observations is used during decoding.
+
+## Training Duration
+
+The original RDP codebase uses epoch-based training with these defaults:
+
+| Stage | Epochs | Batch size |
+|---|---|---|
+| AT (tokenizer) | 601 | 64 |
+| Latent Diffusion | 401 | 64 |
+| Standard Diffusion | 600 | 64 |
+
+LeRobot uses step-based training. Convert epochs to steps:
+
+```
+steps = num_epochs * ceil(dataset_size / batch_size)
+```
+
+### Horizon and action steps
+
+The original RDP maintains a constant ~1.33s wall-clock horizon. The `horizon` must be divisible by `2^len(down_dims)` (8 for the default 3-stage UNet).
+
+| FPS | `horizon` | `n_obs_steps` | `n_action_steps` | Wall-clock |
+|-----|-----------|---------------|-------------------|------------|
+| 12  | 16        | 2             | 15                | 1.33s      |
+| 10  | 16        | 2             | 15                | 1.60s      |
+| 24  | 32        | 2             | 29*               | 1.33s      |
+
+*AT/LDP at 24fps use `dataset_obs_temporal_downsample_ratio=2`, giving `n_action_steps = horizon - n_obs_steps * 2 + 1 = 29`.
+
+### Pre-computed steps for `franka_timing_belt_haply_static_v2`
+
+| Dataset | FPS | Frames | batch_size=64 | | |
+|---|---|---|---|---|---|
+| | | | **DP (600 ep)** | **AT (601 ep)** | **LDP (401 ep)** |
+| `*_v2` | 30 | 32,811 | 307,800 | 308,313 | 205,713 |
+| `*_v2_10hz` | 10 | 10,917 | 102,600 | 102,771 | 68,571 |
+
+## Complete Examples
+
+### Diffusion Policy on 10Hz dataset
+
+Train DP on a 10Hz downsampled dataset with full-size 640x480 images:
+
+```bash
+python -m lerobot.scripts.lerobot_train \
+    --policy.type=diffusion \
+    --dataset.repo_id=domrachev03/franka_timing_belt_haply_static_v3_10hz \
+    --policy.push_to_hub=false \
+    --policy.down_dims='[512,1024,2048]' \
+    --policy.crop_shape='[480,640]' \
     --policy.horizon=16 \
-    --dataset.repo_id=lerobot/pusht
+    --policy.n_obs_steps=2 \
+    --policy.n_action_steps=15 \
+    --batch_size=64 \
+    --steps=102600 \
+    --wandb.enable=true \
+    --wandb.project=rdp_dp_timing_belt_static \
+    --wandb.run_id=diffusion_10hz
 ```
 
-## Training Loop
+When deploying this 10Hz policy on a 30Hz robot, use `--action_interpolation_steps=3` to interpolate actions (see [REPLAY.md](REPLAY.md) and [INFERENCE.md](INFERENCE.md)).
 
-The training script (`lerobot_train.py`) follows this flow:
+### Two-stage RDP on 30Hz dataset
 
-### Initialization
+RDP trains on the original 30Hz dataset (no downsampling needed):
 
-1. Create `Accelerator` (handles distributed training, mixed precision)
-2. Validate config (auto-set output_dir, load optimizer presets, etc.)
-3. Initialize WandB logger (main process only)
-4. Set random seed
-5. Load dataset via `LeRobotDataset` (main process downloads first to avoid race conditions)
-6. Create sim environment for evaluation (optional)
-7. Instantiate policy via `make_policy(cfg.policy, ds_meta=dataset.meta)`
-8. Create preprocessor/postprocessor pipelines
-9. Build optimizer and LR scheduler (from policy presets or explicit config)
-10. Create DataLoader with `EpisodeAwareSampler`
+```bash
+# Stage 1: Train the Asymmetric Tokenizer
+python -m lerobot.scripts.lerobot_train \
+    --policy.discover_packages_path=lerobot.policies.rdp_tokenizer \
+    --policy.type=rdp_tokenizer \
+    --policy.push_to_hub=false \
+    --dataset.repo_id=domrachev03/franka_timing_belt_haply_static_v3 \
+    --policy.encoder_type=conv1d \
+    --policy.decoder_type=rnn \
+    --policy.temporal_cond_keys='[observation.effort]' \
+    --policy.n_latent_dims=4 \
+    --batch_size=64 \
+    --steps=308313 \
+    --wandb.enable=true \
+    --wandb.project=rdp_timing_belt
 
-### Main Loop
-
-```python
-for step in range(steps):
-    batch = next(dataloader)
-    batch = preprocessor(batch)
-
-    loss, info = update_policy(policy, batch, optimizer, scheduler)
-
-    if step % log_freq == 0:
-        log_metrics(loss, grad_norm, lr)
-
-    if step % save_freq == 0:
-        save_checkpoint(step)
-
-    if step % eval_freq == 0:
-        eval_policy(env, policy)
+# Stage 2: Train the Latent Diffusion Policy (point to Stage 1 output)
+python -m lerobot.scripts.lerobot_train \
+    --policy.discover_packages_path=lerobot.policies.rdp_latent_diffusion \
+    --policy.type=rdp_latent_diffusion \
+    --policy.push_to_hub=false \
+    --dataset.repo_id=domrachev03/franka_timing_belt_haply_static_v3 \
+    --policy.pretrained_tokenizer_path=outputs/train/<stage1_run>/checkpoints/last/pretrained_model \
+    --policy.at_encoder_type=conv1d \
+    --policy.at_decoder_type=rnn \
+    --policy.at_temporal_cond_keys='[observation.effort]' \
+    --policy.at_n_latent_dims=4 \
+    --policy.vision_backbone=resnet18 \
+    --policy.crop_shape='[480,640]' \
+    --policy.num_train_timesteps=100 \
+    --batch_size=64 \
+    --steps=205713 \
+    --wandb.enable=true \
+    --wandb.project=rdp_timing_belt
 ```
-
-### update_policy()
-
-1. **Forward pass** with accelerator autocast (mixed precision)
-2. **Backward pass** via `accelerator.backward(loss)`
-3. **Gradient clipping** via `accelerator.clip_grad_norm_()`
-4. **Optimizer step**
-5. **LR scheduler step**
-6. **Policy update hook** (e.g., EMA update for diffusion policies)
-
-## Policy System
-
-### Available Policies
-
-| Type | Description |
-|---|---|
-| `diffusion` | Diffusion Policy (1D conditional UNet) |
-| `act` | Action Chunking Transformers |
-| `vqbet` | VQ-BeT (Residual VQ-VAE + GPT) |
-| `tdmpc` | Temporal Difference MPC |
-| `pi0` | Physical Intelligence Pi0 (VLA) |
-| `pi05` | Physical Intelligence Pi0.5 |
-| `sac` | Soft Actor-Critic (RL) |
-| `smolvla` | SmolVLA (lightweight VLA) |
-
-### Policy Config (PreTrainedConfig)
-
-All policies extend `PreTrainedConfig`:
-
-```python
-@dataclass
-class PreTrainedConfig(HubMixin, draccus.ChoiceRegistry, abc.ABC):
-    n_obs_steps: int = 1                      # Observation history length
-    input_features: dict[str, PolicyFeature]  # Auto-populated from dataset
-    output_features: dict[str, PolicyFeature]
-    device: str | None = None
-    use_amp: bool = False                     # Automatic Mixed Precision
-
-    # HuggingFace Hub
-    push_to_hub: bool = True
-    repo_id: str | None = None
-    pretrained_path: Path | None = None
-```
-
-Each policy defines its own default optimizer and scheduler presets:
-
-```python
-@PreTrainedConfig.register_subclass("diffusion")
-@dataclass
-class DiffusionConfig(PreTrainedConfig):
-    horizon: int = 16
-    n_action_steps: int = 8
-    vision_backbone: str = "resnet18"
-    down_dims: tuple[int, ...] = (512, 1024, 2048)
-    noise_scheduler_type: str = "DDPM"
-    num_train_timesteps: int = 100
-    # ...
-
-    def get_optimizer_preset(self) -> AdamConfig:
-        return AdamConfig(lr=1e-4, betas=(0.95, 0.999))
-
-    def get_scheduler_preset(self) -> DiffuserSchedulerConfig:
-        return DiffuserSchedulerConfig(name="cosine", num_warmup_steps=500)
-```
-
-### Feature Types
-
-```python
-class FeatureType(str, Enum):
-    STATE = "STATE"       # Proprioceptive state
-    VISUAL = "VISUAL"     # Camera images
-    ACTION = "ACTION"     # Robot actions
-    ENV = "ENV"           # Environment state
-    REWARD = "REWARD"     # Task rewards
-    LANGUAGE = "LANGUAGE" # Language instructions
-
-@dataclass
-class PolicyFeature:
-    type: FeatureType
-    shape: tuple[int, ...]    # Without batch/time dimensions
-```
-
-## Optimizer System
-
-### Available Optimizers
-
-| Type | Description |
-|---|---|
-| `adam` | Adam with configurable betas, eps, weight_decay |
-| `adamw` | AdamW (decoupled weight decay) |
-| `sgd` | SGD with momentum, nesterov support |
-
-All optimizers include a `grad_clip_norm` field (default: 10.0).
-
-### Available LR Schedulers
-
-| Type | Description |
-|---|---|
-| `diffuser` | HuggingFace Diffusers scheduler (cosine, linear, etc.) |
-| `vqbet` | Custom two-stage scheduler for VQ-BeT |
-| `cosine_decay_with_warmup` | Linear warmup + cosine decay |
-
-## Dataset System
-
-### LeRobotDataset
-
-Datasets are stored as chunked parquet files with optional video:
-
-```
-dataset_root/
-  data/
-    chunk-000/
-      file-000.parquet          # Observation/action columns
-  meta/
-    info.json                   # fps, features, shapes
-    stats.json                  # Normalization statistics
-    tasks.parquet               # Task descriptions
-    episodes/
-      chunk-000/
-        file-000.parquet        # Episode index
-  videos/
-    observation.images.front/
-      chunk-000/
-        file-000.mp4            # Video-encoded frames
-```
-
-Key properties:
-- `fps` — frames per second
-- `features` — dict of feature definitions (shape, dtype)
-- `meta.stats` — normalization statistics (mean, std, min, max per feature)
-- `camera_keys` — list of visual modality keys
-
-### Dataset Factory
-
-`make_dataset(cfg)` handles:
-1. Creating `LeRobotDatasetMetadata` from `repo_id`
-2. Resolving `delta_timestamps` from policy config and dataset FPS
-3. Creating image transforms if enabled
-4. Instantiating `LeRobotDataset` (or `StreamingLeRobotDataset`)
-5. Optionally replacing camera stats with ImageNet statistics
-
-## Preprocessor/Postprocessor Pipelines
-
-Data flows through composable processor pipelines:
-
-**Training**:
-```
-Dataset Batch → Preprocessor → Policy Forward → Loss
-```
-
-**Inference**:
-```
-Observation → Preprocessor → Policy → Postprocessor → Action
-```
-
-Common processor steps:
-- `DeviceProcessorStep` — move tensors to device
-- `NormalizerProcessorStep` — normalize with dataset statistics
-- `UnnormalizerProcessorStep` — unnormalize actions
-- `RenameObservationsProcessorStep` — rename observation keys
-- `AddBatchDimensionProcessorStep` — add batch dim for single samples
-
-Each policy defines its own processor factory (e.g., `make_diffusion_pre_post_processors()`).
 
 ## Checkpoints
 
@@ -360,31 +495,6 @@ python -m lerobot.scripts.lerobot_train \
 
 This restores the full training state: model weights, optimizer, scheduler, RNG states, and step counter.
 
-## HuggingFace Hub Integration
-
-### Push trained model to Hub
-
-Set in config or CLI:
-
-```bash
---policy.push_to_hub=true \
---policy.repo_id=my_user/my_policy
-```
-
-After training completes, the model is uploaded with:
-- `config.json` + `model.safetensors`
-- Auto-generated model card (README.md)
-- Tags: `["robotics", "lerobot", "<policy_type>"]`
-
-### Load pretrained model
-
-```python
-from lerobot.policies.pretrained import PreTrainedPolicy
-policy = PreTrainedPolicy.from_pretrained("lerobot/diffusion_pusht")
-```
-
-Or via CLI: `--policy.path=lerobot/diffusion_pusht`
-
 ## Distributed Training
 
 LeRobot uses HuggingFace Accelerate for distributed training:
@@ -395,252 +505,18 @@ accelerate config
 
 # Launch distributed training
 accelerate launch -m lerobot.scripts.lerobot_train \
-    --policy.path=lerobot/diffusion_pusht \
-    --dataset.repo_id=lerobot/pusht \
+    --policy.type=diffusion \
+    --dataset.repo_id=domrachev03/franka_timing_belt_haply_static_v3_10hz \
+    --policy.crop_shape='[480,640]' \
     --batch_size=64
 ```
 
 Mixed precision is handled automatically via `accelerator.autocast()`.
 
----
+## Next Steps
 
-# Training on Real-World Datasets
-
-This section covers training policies on real-world datasets collected with crisp_fastapi robots (Franka, Flexiv).
-
-## Dataset Observation Structure
-
-Real-world datasets use grouped observation columns instead of a single flat `observation.state` vector. Each group is a separate dataset column:
-
-| Column | Dims | Contents |
-|---|---|---|
-| `observation.state` | 8 | `tcp.pos`(3) + `tcp.quat`(4) + `gripper.pos`(1) |
-| `observation.effort` | 6 | `ft_sensor.force`(3) + `ft_sensor.torque`(3) |
-| `observation.joints` | 7 | `joint.pos`(7) |
-| `observation.joint_vel` | 7 | `joint.vel`(7) |
-
-All columns are mapped to `FeatureType.STATE` and loaded into the batch. However, each policy type uses different subsets:
-
-- **Diffusion Policy** — conditions the UNet on `observation.state` only (`robot_state_feature` matches exactly `observation.state`). Other columns are loaded but unused by the model.
-- **RDP Tokenizer** — the RNN decoder is conditioned per-step on columns listed in `temporal_cond_keys`. Typically `observation.effort` for force/torque reactivity.
-- **RDP Latent Diffusion** — the UNet conditions on `observation.state` (same as DP). The frozen AT decoder conditions on `at_temporal_cond_keys`.
-
-This grouping is supported by `hw_to_dataset_features()` in `datasets/utils.py`, which treats dict-valued entries in `observation_features` as named groups, each becoming a separate `observation.<group_name>` column.
-
-## Training Diffusion Policy
-
-```bash
-python -m lerobot.scripts.lerobot_train \
-    --policy.type=diffusion \
-    --dataset.repo_id=domrachev03/franka_timing_belt_haply \
-    --policy.push_to_hub=false \
-    --policy.down_dims='[256,512,1024]' \
-    --policy.crop_shape='[84,84]' \
-    --wandb.enable=true \
-    --wandb.project=rdp_timing_belt
-```
-
-### Important notes
-
-- **`push_to_hub=false`**: Required when `repo_id` is not set. Otherwise validation fails.
-- **`down_dims`**: The UNet downsampling factor is `2^len(down_dims)`. The `horizon` must be divisible by this factor. Default `(512,1024,2048)` requires `horizon % 8 == 0`. Use `(256,512,1024)` for a smaller model.
-- **`crop_shape`**: Must use JSON array syntax: `'[84,84]'`. Python tuple syntax `'(84, 84)'` does not work with draccus CLI parsing.
-- **Feature mapping**: The dataset's `observation.state` is mapped to `STATE` features and camera images to `VISUAL` features automatically via `dataset_to_policy_features()`.
-- **State conditioning**: The UNet's `robot_state_feature` property matches only the column named exactly `observation.state` (8-dim: tcp + gripper). Other observation columns (`observation.effort`, `observation.joints`, `observation.joint_vel`) are present in `input_features` but are not read by the Diffusion model.
-
----
-
-# Training Reactive Diffusion Policy (RDP) with LeRobot
-
-This guide covers training the two-stage Reactive Diffusion Policy (Xue et al., RSS 2025) using the LeRobot framework.
-
-## Overview
-
-RDP consists of two stages trained sequentially:
-
-1. **Asymmetric Tokenizer (AT)** (`rdp_tokenizer`) — a VAE/VQ-VAE that compresses action chunks into a low-dimensional latent space. The encoder is simple (MLP or Conv1D); the decoder is optionally an RNN conditioned on temporal observations (e.g. force/torque data).
-2. **Latent Diffusion Policy (LDP)** (`rdp_latent_diffusion`) — a conditional 1-D UNet diffusion model that operates in the latent action space of the frozen AT. It uses the same vision encoder architecture as the standard Diffusion Policy.
-
-### Plugin discovery
-
-RDP policies are not built into the LeRobot CLI's default policy choices. You **must** pass `--policy.discover_packages_path` to register them:
-
-```bash
-# For AT (Stage 1):
---policy.discover_packages_path=lerobot.policies.rdp_tokenizer
-
-# For LDP (Stage 2):
---policy.discover_packages_path=lerobot.policies.rdp_latent_diffusion
-```
-
-### CLI syntax for list/tuple fields
-
-Draccus does not support Python tuple syntax in CLI arguments. Use JSON array syntax instead:
-
-```bash
-# Correct:
---policy.temporal_cond_keys='[observation.effort]'
---policy.crop_shape='[84,84]'
---policy.down_dims='[256,512,1024]'
-
-# WRONG (will fail):
---policy.temporal_cond_keys='("observation.effort",)'
---policy.crop_shape='(84, 84)'
-```
-
-## Stage 1: Train the Asymmetric Tokenizer
-
-The AT learns to encode and decode action trajectories. It does not use image observations.
-
-```bash
-python -m lerobot.scripts.lerobot_train \
-    --policy.discover_packages_path=lerobot.policies.rdp_tokenizer \
-    --policy.type=rdp_tokenizer \
-    --policy.push_to_hub=false \
-    --dataset.repo_id=domrachev03/franka_timing_belt_haply \
-    --policy.decoder_type=rnn \
-    --policy.temporal_cond_keys='[observation.effort]' \
-    --wandb.enable=true \
-    --wandb.project=rdp_timing_belt
-```
-
-The RNN decoder is conditioned per-step on `observation.effort` (force/torque), making the decoded actions reactive to contact forces. The encoder compresses action chunks without any observation input.
-
-### Key configuration options
-
-| Parameter | Default | Description |
-|---|---|---|
-| `horizon` | 32 | Length of the action chunk to encode/decode |
-| `encoder_type` | `"conv1d"` | Encoder architecture: `"mlp"` or `"conv1d"` |
-| `n_latent_dims` | 4 | Dimensionality of the latent code |
-| `encoder_hidden_dim` | 32 | Hidden dimension for encoder layers |
-| `decoder_type` | `"mlp"` | Decoder architecture: `"mlp"` or `"rnn"` |
-| `decoder_hidden_dim` | 32 | Hidden dimension for decoder layers |
-| `use_vq` | `False` | Use Residual VQ instead of Gaussian VAE |
-| `n_embed` | 32 | Codebook size (VQ) or quant channel dim (VAE) |
-| `temporal_cond_keys` | `()` | Observation columns for RNN temporal conditioning (required when `decoder_type="rnn"`). Each entry must match a dataset column name (e.g. `observation.effort`). Multiple columns can be listed: `'[observation.effort,observation.state]'`. |
-| `kl_multiplier` | 1e-6 | KL divergence loss weight (Gaussian VAE mode) |
-| `vq_loss_multiplier` | 5.0 | VQ commitment loss weight (VQ mode) |
-| `act_scale` | 1.0 | Divisor applied to normalised actions before encoding |
-
-### Encoder types
-
-- **`mlp`**: Flattens the action chunk and processes with an MLP. Latent is a single vector.
-- **`conv1d`**: Uses 1-D convolutions with stride-2 downsampling. Latent is a sequence shorter than the input, which the LDP diffuses over as a 1-D trajectory.
-
-### Decoder types
-
-- **`mlp`**: Standard MLP decoder. No temporal conditioning.
-- **`rnn`**: GRU-based decoder with temporal conditioning. Requires `temporal_cond_keys` to specify which observation features to use as step-by-step conditioning (e.g. force/torque readings, tactile data). This is the "asymmetric" part — the decoder has access to per-step observations that the encoder does not. When using RNN, the `observation_delta_indices` is automatically extended to cover the full horizon so that per-step conditioning data is available.
-
-### Training output
-
-The trained AT checkpoint will be saved to the standard LeRobot output directory:
-
-```
-outputs/train/<run_name>/checkpoints/<step>/pretrained_model/
-```
-
-Note this path — you will need it for Stage 2.
-
-## Stage 2: Train the Latent Diffusion Policy
-
-The LDP requires a pre-trained AT checkpoint from Stage 1.
-
-```bash
-python -m lerobot.scripts.lerobot_train \
-    --policy.discover_packages_path=lerobot.policies.rdp_latent_diffusion \
-    --policy.type=rdp_latent_diffusion \
-    --policy.push_to_hub=false \
-    --dataset.repo_id=domrachev03/franka_timing_belt_haply \
-    --policy.pretrained_tokenizer_path=outputs/train/<stage1_run>/checkpoints/last/pretrained_model \
-    --policy.at_decoder_type=rnn \
-    --policy.at_temporal_cond_keys='[observation.effort]' \
-    --wandb.enable=true \
-    --wandb.project=rdp_timing_belt
-```
-
-The UNet conditions on `observation.state` (tcp + gripper) via the same `robot_state_feature` mechanism as standard DP. The frozen AT decoder uses `at_temporal_cond_keys` for per-step force/torque conditioning during action decoding.
-
-### Key configuration options
-
-| Parameter | Default | Description |
-|---|---|---|
-| `pretrained_tokenizer_path` | `None` | Path to trained AT checkpoint (required) |
-| `use_latent_action_before_vq` | `False` | Diffuse on pre-quantisation latent (only relevant when AT uses VQ) |
-| `vision_backbone` | `"resnet18"` | Vision encoder backbone |
-| `crop_shape` | `(84, 84)` | Random crop size for image augmentation |
-| `down_dims` | `(512, 1024, 2048)` | UNet channel dimensions |
-| `noise_scheduler_type` | `"DDIM"` | Noise scheduler: `"DDIM"` or `"DDPM"` |
-| `num_train_timesteps` | 100 | Number of diffusion timesteps |
-| `num_inference_steps` | `None` | Inference steps (defaults to `num_train_timesteps`) |
-| `prediction_type` | `"epsilon"` | What the UNet predicts: `"epsilon"` or `"sample"` |
-
-### AT architecture parameters
-
-The LDP config duplicates the AT architecture parameters with an `at_` prefix so that the AT can be reconstructed at load time without the original config:
-
-| Parameter | Default | Mirrors AT |
-|---|---|---|
-| `at_encoder_type` | `"conv1d"` | `encoder_type` |
-| `at_n_latent_dims` | 4 | `n_latent_dims` |
-| `at_encoder_hidden_dim` | 32 | `encoder_hidden_dim` |
-| `at_encoder_n_layers` | 1 | `encoder_n_layers` |
-| `at_decoder_type` | `"rnn"` | `decoder_type` |
-| `at_decoder_hidden_dim` | 32 | `decoder_hidden_dim` |
-| `at_decoder_n_layers` | 1 | `decoder_n_layers` |
-| `at_use_vq` | `False` | `use_vq` |
-| `at_n_embed` | 32 | `n_embed` |
-| `at_vqvae_groups` | 4 | `vqvae_groups` |
-| `at_act_scale` | 1.0 | `act_scale` |
-| `at_temporal_cond_keys` | `()` | `temporal_cond_keys` |
-
-These **must match** the values used when training the AT in Stage 1.
-
-### What happens during training
-
-1. Actions from the dataset are encoded to latent space using the frozen AT encoder + quantization.
-2. The UNet learns to denoise these latent actions, conditioned on image and state observations.
-3. The AT is never updated — only the vision encoder and UNet are trained.
-
-### What happens during inference
-
-1. The vision encoder + UNet produce a denoised latent action.
-2. The frozen AT decoder converts the latent back to the original action space.
-3. If the AT uses an RNN decoder, temporal conditioning from the current observations is used during decoding.
-
-## Complete two-stage example
-
-```bash
-# Stage 1: Train the Asymmetric Tokenizer
-python -m lerobot.scripts.lerobot_train \
-    --policy.discover_packages_path=lerobot.policies.rdp_tokenizer \
-    --policy.type=rdp_tokenizer \
-    --policy.push_to_hub=false \
-    --dataset.repo_id=domrachev03/franka_timing_belt_haply \
-    --policy.encoder_type=conv1d \
-    --policy.decoder_type=rnn \
-    --policy.temporal_cond_keys='[observation.effort]' \
-    --policy.n_latent_dims=4 \
-    --wandb.enable=true \
-    --wandb.project=rdp_timing_belt
-
-# Stage 2: Train the Latent Diffusion Policy (point to Stage 1 output)
-python -m lerobot.scripts.lerobot_train \
-    --policy.discover_packages_path=lerobot.policies.rdp_latent_diffusion \
-    --policy.type=rdp_latent_diffusion \
-    --policy.push_to_hub=false \
-    --dataset.repo_id=domrachev03/franka_timing_belt_haply \
-    --policy.pretrained_tokenizer_path=outputs/train/<stage1_run>/checkpoints/last/pretrained_model \
-    --policy.at_encoder_type=conv1d \
-    --policy.at_decoder_type=rnn \
-    --policy.at_temporal_cond_keys='[observation.effort]' \
-    --policy.at_n_latent_dims=4 \
-    --policy.vision_backbone=resnet18 \
-    --policy.num_train_timesteps=100 \
-    --wandb.enable=true \
-    --wandb.project=rdp_timing_belt
-```
+- **Replay**: Verify the trained policy by replaying recorded trajectories — see [REPLAY.md](REPLAY.md)
+- **Inference**: Deploy the trained policy on the real robot — see [INFERENCE.md](INFERENCE.md)
 
 ## Reference
 

@@ -74,7 +74,7 @@ import torch.utils.data
 import tqdm
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.utils.constants import ACTION, DONE, OBS_STATE, REWARD
+from lerobot.utils.constants import ACTION, DONE, OBS_PREFIX, REWARD
 
 
 def to_hwc_uint8_numpy(chw_float32_torch: torch.Tensor) -> np.ndarray:
@@ -145,10 +145,11 @@ def visualize_dataset(
                 for dim_idx, val in enumerate(batch[ACTION][i]):
                     rr.log(f"{ACTION}/{dim_idx}", rr.Scalars(val.item()))
 
-            # display each dimension of observed state space (e.g. agent position in joint space)
-            if OBS_STATE in batch:
-                for dim_idx, val in enumerate(batch[OBS_STATE][i]):
-                    rr.log(f"state/{dim_idx}", rr.Scalars(val.item()))
+            # display each dimension of all observation columns (state, effort, joints, etc.)
+            for key in batch:
+                if key.startswith(OBS_PREFIX) and key not in dataset.meta.camera_keys:
+                    for dim_idx, val in enumerate(batch[key][i]):
+                        rr.log(f"{key}/{dim_idx}", rr.Scalars(val.item()))
 
             if DONE in batch:
                 rr.log(DONE, rr.Scalars(batch[DONE][i].item()))

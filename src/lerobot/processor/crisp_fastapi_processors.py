@@ -15,6 +15,7 @@ Observation processors:
    for external F/T sensor readings.
 """
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -504,6 +505,66 @@ class HaplyToCrispClutchProcessor(RobotActionProcessorStep):
         self._initial_robot_quat_wxyz = None
         self._gripper_open = True
         self._initialized = False
+
+
+@ProcessorStepRegistry.register("gripper_interpolation")
+@dataclass
+class GripperInterpolationProcessor(RobotActionProcessorStep):
+    """Smoothly interpolate gripper width toward the target at a fixed speed.
+
+    Teleoperators send binary gripper commands (fully open / fully closed).
+    This processor ramps the gripper width at ``gripper_speed`` m/s so that
+    the physical gripper moves smoothly instead of jumping instantly.
+
+    Must be placed *after* the teleop-specific processor (which produces
+    ``gripper.pos`` targets) and *before* ``AbsoluteToTwistProcessor``.
+    """
+
+    gripper_speed: float = 0.1  # m/s
+    gripper_key: str = "gripper.pos"
+    obs_gripper_key: str = "gripper.pos"
+
+    # Internal state
+    _current_width: float | None = field(default=None, init=False, repr=False)
+    _last_time: float | None = field(default=None, init=False, repr=False)
+
+    def action(self, action: RobotAction) -> RobotAction:
+        obs = self.transition.get(TransitionKey.OBSERVATION, {})
+        now = time.monotonic()
+
+        if self._current_width is None:
+            self._current_width = float(obs.get(self.obs_gripper_key, action[self.gripper_key]))
+            self._last_time = now
+
+        dt = now - self._last_time
+        self._last_time = now
+
+        target = float(action[self.gripper_key])
+        diff = target - self._current_width
+        max_step = self.gripper_speed * dt
+        if abs(diff) <= max_step:
+            self._current_width = target
+        else:
+            self._current_width += max_step if diff > 0 else -max_step
+
+        action[self.gripper_key] = self._current_width
+        return action
+
+    def transform_features(
+        self, features: dict, in_key: str | None = None, out_key: str | None = None
+    ) -> dict:
+        return features
+
+    def get_config(self) -> dict:
+        return {
+            "gripper_speed": self.gripper_speed,
+            "gripper_key": self.gripper_key,
+            "obs_gripper_key": self.obs_gripper_key,
+        }
+
+    def reset(self) -> None:
+        self._current_width = None
+        self._last_time = None
 
 
 @ProcessorStepRegistry.register("absolute_to_twist")

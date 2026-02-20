@@ -48,12 +48,13 @@ from pprint import pformat
 from lerobot.configs import parser
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.processor import (
-    make_default_robot_action_processor,
+    make_processors_for,
 )
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
     bi_so100_follower,
+    crisp_ws,
     earthrover_mini_plus,
     hope_jr,
     koch_follower,
@@ -62,6 +63,7 @@ from lerobot.robots import (  # noqa: F401
     so100_follower,
     so101_follower,
 )
+from lerobot.utils.action_interpolator import divide_twist
 from lerobot.utils.constants import ACTION
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.robot_utils import precise_sleep
@@ -89,6 +91,9 @@ class ReplayConfig:
     dataset: DatasetReplayConfig
     # Use vocal synthesis to read events.
     play_sounds: bool = True
+    # Number of interpolation sub-steps per action (0 = disabled).
+    # E.g. 3 sends 3 sub-actions per dataset frame, tripling the robot command rate.
+    action_interpolation_steps: int = 0
 
 
 @parser.wrap()
@@ -96,7 +101,7 @@ def replay(cfg: ReplayConfig):
     init_logging()
     logging.info(pformat(asdict(cfg)))
 
-    robot_action_processor = make_default_robot_action_processor()
+    _, robot_action_processor, _ = make_processors_for(cfg.robot.type)
 
     robot = make_robot_from_config(cfg.robot)
     dataset = LeRobotDataset(cfg.dataset.repo_id, root=cfg.dataset.root, episodes=[cfg.dataset.episode])
@@ -105,6 +110,8 @@ def replay(cfg: ReplayConfig):
     episode_frames = dataset.hf_dataset.filter(lambda x: x["episode_index"] == cfg.dataset.episode)
     actions = episode_frames.select_columns(ACTION)
 
+    n_substeps = cfg.action_interpolation_steps
+
     robot.connect()
 
     log_say("Replaying episode", cfg.play_sounds, blocking=True)
@@ -112,18 +119,35 @@ def replay(cfg: ReplayConfig):
         start_episode_t = time.perf_counter()
 
         action_array = actions[idx][ACTION]
+        action_spec = dataset.features[ACTION]
+        names = action_spec["names"]
+        feature_sizes = action_spec.get("feature_sizes", {n: 1 for n in names})
         action = {}
-        for i, name in enumerate(dataset.features[ACTION]["names"]):
-            action[name] = action_array[i]
+        offset = 0
+        for name in names:
+            size = feature_sizes[name]
+            if size == 1:
+                action[name] = action_array[offset]
+            else:
+                action[name] = action_array[offset:offset + size]
+            offset += size
 
-        robot_obs = robot.get_observation()
-
-        processed_action = robot_action_processor((action, robot_obs))
-
-        _ = robot.send_action(processed_action)
-
-        dt_s = time.perf_counter() - start_episode_t
-        precise_sleep(1 / dataset.fps - dt_s)
+        if n_substeps > 0:
+            divided = divide_twist(action, n_substeps)
+            substep_dt = 1.0 / (dataset.fps * n_substeps)
+            for _ in range(n_substeps):
+                sub_start = time.perf_counter()
+                robot_obs = robot.get_observation()
+                absolute = robot_action_processor((divided, robot_obs))
+                robot.send_action(absolute)
+                elapsed = time.perf_counter() - sub_start
+                precise_sleep(substep_dt - elapsed)
+        else:
+            robot_obs = robot.get_observation()
+            processed_action = robot_action_processor((action, robot_obs))
+            robot.send_action(processed_action)
+            dt_s = time.perf_counter() - start_episode_t
+            precise_sleep(1 / dataset.fps - dt_s)
 
     robot.disconnect()
 

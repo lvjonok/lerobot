@@ -118,6 +118,7 @@ from lerobot.teleoperators import (  # noqa: F401
     spacemouse,
 )
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
+from lerobot.utils.action_interpolator import divide_twist
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.control_utils import (
     init_keyboard_listener,
@@ -194,6 +195,10 @@ class RecordConfig:
     play_sounds: bool = True
     # Resume recording on an existing dataset.
     resume: bool = False
+    # Number of interpolation sub-steps per action (0 = disabled).
+    # E.g. 3 sends 3 sub-actions per dataset frame, tripling the robot command rate.
+    # Only applies to the policy branch; teleop already runs at recording FPS.
+    action_interpolation_steps: int = 0
 
     def __post_init__(self):
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
@@ -264,6 +269,7 @@ def record_loop(
     control_time_s: int | None = None,
     single_task: str | None = None,
     display_data: bool = False,
+    action_interpolation_steps: int = 0,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -353,18 +359,28 @@ def record_loop(
             )
             continue
 
-        # Applies a pipeline to the action, default is IdentityProcessor
+        # Applies robot_action_processor and sends action to robot.
+        # With interpolation (policy branch only): divide twist by N, then send N sub-steps
+        # with fresh observations so each sub-step adapts to the robot's actual position.
         if policy is not None and act_processed_policy is not None:
             action_values = act_processed_policy
-            robot_action_to_send = robot_action_processor((act_processed_policy, obs))
+            if action_interpolation_steps > 0:
+                divided = divide_twist(act_processed_policy, action_interpolation_steps)
+                substep_dt = 1.0 / (fps * action_interpolation_steps)
+                for _ in range(action_interpolation_steps):
+                    sub_start = time.perf_counter()
+                    live_obs = robot.get_observation()
+                    absolute = robot_action_processor((divided, live_obs))
+                    robot.send_action(absolute)
+                    elapsed = time.perf_counter() - sub_start
+                    precise_sleep(substep_dt - elapsed)
+            else:
+                robot_action_to_send = robot_action_processor((act_processed_policy, obs))
+                robot.send_action(robot_action_to_send)
         else:
             action_values = act_processed_teleop
             robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
-
-        # Action can eventually be clipped using `max_relative_target`,
-        # so action actually sent is saved in the dataset. action = postprocessor.process(action)
-        # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
-        _sent_action = robot.send_action(robot_action_to_send)
+            robot.send_action(robot_action_to_send)
 
         # Write to dataset
         if dataset is not None:
@@ -375,8 +391,9 @@ def record_loop(
         if display_data:
             log_rerun_data(observation=obs_processed, action=action_values)
 
-        dt_s = time.perf_counter() - start_loop_t
-        precise_sleep(1 / fps - dt_s)
+        if not (action_interpolation_steps > 0 and policy is not None):
+            dt_s = time.perf_counter() - start_loop_t
+            precise_sleep(1 / fps - dt_s)
 
         timestamp = time.perf_counter() - start_episode_t
 
@@ -396,6 +413,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         robot_type=cfg.robot.type,
         teleop_config=cfg.teleop,
     )
+    logging.info(f"[DIAG] robot_action_processor steps: {[type(s).__name__ for s in robot_action_processor.steps]}")
 
     dataset_features = combine_feature_dicts(
         aggregate_pipeline_dataset_features(
@@ -498,6 +516,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     control_time_s=cfg.dataset.episode_time_s,
                     single_task=cfg.dataset.single_task,
                     display_data=cfg.display_data,
+                    action_interpolation_steps=cfg.action_interpolation_steps,
                 )
 
                 # Execute a few seconds without recording to give time to manually reset the environment

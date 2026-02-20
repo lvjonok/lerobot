@@ -285,10 +285,7 @@ def teleoperate(cfg: TeleoperateConfig):
         teleop.disconnect()
 
         # possibly move robot home
-        if robot.name == "slim_crisp":
-            logging.info("Moving robot to home position")
-            robot._robot.home()
-        elif robot.name in ("crisp_fastapi", "crisp_ws"):
+        if robot.name in ("slim_crisp", "crisp_fastapi", "crisp_ws"):
             logging.info("Moving robot to home position")
             robot.go_home()
 
