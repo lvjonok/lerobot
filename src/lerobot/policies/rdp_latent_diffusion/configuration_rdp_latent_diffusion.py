@@ -68,6 +68,7 @@ class RDPLatentDiffusionConfig(PreTrainedConfig):
     vision_backbone: str = "resnet18"
     crop_shape: tuple[int, int] | None = (84, 84)
     crop_is_random: bool = True
+    resize_shape: tuple[int, int] | None = None
     pretrained_backbone_weights: str | None = None
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32

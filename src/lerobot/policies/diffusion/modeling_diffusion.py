@@ -457,6 +457,12 @@ class DiffusionRgbEncoder(nn.Module):
         else:
             self.do_crop = False
 
+        if config.resize_shape is not None:
+            self.do_resize = True
+            self.resize = torchvision.transforms.Resize(config.resize_shape)
+        else:
+            self.do_resize = False
+
         # Set up backbone.
         backbone_model = getattr(torchvision.models, config.vision_backbone)(
             weights=config.pretrained_backbone_weights
@@ -478,12 +484,16 @@ class DiffusionRgbEncoder(nn.Module):
         # Set up pooling and final layers.
         # Use a dry run to get the feature map shape.
         # The dummy input should take the number of image channels from `config.image_features` and it should
-        # use the height and width from `config.crop_shape` if it is provided, otherwise it should use the
-        # height and width from `config.image_features`.
+        # use the height and width determined by the preprocessing pipeline: resize_shape > crop_shape > original.
 
         # Note: we have a check in the config class to make sure all images have the same shape.
         images_shape = next(iter(config.image_features.values())).shape
-        dummy_shape_h_w = config.crop_shape if config.crop_shape is not None else images_shape[1:]
+        if config.resize_shape is not None:
+            dummy_shape_h_w = config.resize_shape
+        elif config.crop_shape is not None:
+            dummy_shape_h_w = config.crop_shape
+        else:
+            dummy_shape_h_w = images_shape[1:]
         dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
 
@@ -499,13 +509,15 @@ class DiffusionRgbEncoder(nn.Module):
         Returns:
             (B, D) image feature.
         """
-        # Preprocess: maybe crop (if it was set up in the __init__).
+        # Preprocess: maybe crop, then maybe resize.
         if self.do_crop:
             if self.training:  # noqa: SIM108
                 x = self.maybe_random_crop(x)
             else:
                 # Always use center crop for eval.
                 x = self.center_crop(x)
+        if self.do_resize:
+            x = self.resize(x)
         # Extract backbone feature.
         x = torch.flatten(self.pool(self.backbone(x)), start_dim=1)
         # Final linear layer with non-linearity.

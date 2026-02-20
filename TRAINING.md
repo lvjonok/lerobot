@@ -107,6 +107,7 @@ Draccus does not support Python tuple syntax in CLI arguments. Use JSON array sy
 ```bash
 # Correct:
 --policy.crop_shape='[480,640]'
+--policy.resize_shape='[120,160]'
 --policy.down_dims='[256,512,1024]'
 --policy.temporal_cond_keys='[observation.effort]'
 
@@ -175,7 +176,8 @@ python -m lerobot.scripts.lerobot_train \
 
 - **`push_to_hub=false`**: Required when `repo_id` is not set. Otherwise validation fails.
 - **`down_dims`**: The UNet downsampling factor is `2^len(down_dims)`. The `horizon` must be divisible by this factor. Default `(512,1024,2048)` requires `horizon % 8 == 0`. Use `(256,512,1024)` for a smaller model.
-- **`crop_shape`**: Set to match camera resolution from the recording config. For 640x480 cameras (see `configs/record/franka_haply.yaml`), use `'[480,640]'` (H, W) to train on full-size images.
+- **`crop_shape`**: Set to match camera resolution from the recording config. For 640x480 cameras (see `configs/record/franka_haply.yaml`), use `'[480,640]'` (H, W) to train on full-size images. Set to `null` to disable cropping.
+- **`resize_shape`**: Optional (H, W) target size using bilinear interpolation. Applied after cropping (if any). Use this to reduce image dimensions without cropping, e.g. `--policy.crop_shape=null --policy.resize_shape='[120,160]'`. Defaults to `None` (no resizing).
 - **Dataset FPS**: Use a 10Hz downsampled dataset for DP (see above). The 30Hz dataset is for RDP.
 - **Feature mapping**: The dataset's `observation.state` is mapped to `STATE` features and camera images to `VISUAL` features automatically via `dataset_to_policy_features()`.
 - **State conditioning**: The UNet's `robot_state_feature` property matches only the column named exactly `observation.state` (8-dim: tcp + gripper). Other observation columns (`observation.effort`, `observation.joints`, `observation.joint_vel`) are present in `input_features` but are not read by the Diffusion model.
@@ -315,7 +317,8 @@ Latent stats computed over N batches: min=[...], max=[...]
 | `pretrained_tokenizer_path` | `None` | Path to trained AT checkpoint (required) |
 | `use_latent_action_before_vq` | `False` | Diffuse on pre-quantisation latent (only relevant when AT uses VQ) |
 | `vision_backbone` | `"resnet18"` | Vision encoder backbone |
-| `crop_shape` | `(84, 84)` | Crop size for image augmentation. Set to camera resolution `(480, 640)` for full-size images |
+| `crop_shape` | `(84, 84)` | Crop size for image augmentation. Set to camera resolution `(480, 640)` for full-size images. `None` to disable |
+| `resize_shape` | `None` | Resize images to (H, W) via bilinear interpolation (applied after crop). Use instead of or in addition to cropping |
 | `down_dims` | `(512, 1024, 2048)` | UNet channel dimensions |
 | `noise_scheduler_type` | `"DDIM"` | Noise scheduler: `"DDIM"` or `"DDPM"` |
 | `num_train_timesteps` | 100 | Number of diffusion timesteps |

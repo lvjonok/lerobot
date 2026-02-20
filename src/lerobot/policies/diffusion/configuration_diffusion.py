@@ -68,6 +68,8 @@ class DiffusionConfig(PreTrainedConfig):
             within the image size. If None, no cropping is done.
         crop_is_random: Whether the crop should be random at training time (it's always a center crop in eval
             mode).
+        resize_shape: (H, W) shape to resize images to (bilinear interpolation) as a preprocessing step for
+            the vision backbone. Applied after cropping (if any). If None, no resizing is done.
         pretrained_backbone_weights: Pretrained weights from torchvision to initialize the backbone.
             `None` means no pretrained weights.
         use_group_norm: Whether to replace batch normalization with group normalization in the backbone.
@@ -125,6 +127,7 @@ class DiffusionConfig(PreTrainedConfig):
     vision_backbone: str = "resnet18"
     crop_shape: tuple[int, int] | None = (84, 84)
     crop_is_random: bool = True
+    resize_shape: tuple[int, int] | None = None
     pretrained_backbone_weights: str | None = None
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
