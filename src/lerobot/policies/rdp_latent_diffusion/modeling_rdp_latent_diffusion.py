@@ -7,7 +7,9 @@ Asymmetric Tokenizer (AT).
 """
 
 import logging
+import threading
 from collections import deque
+from concurrent.futures import Future
 from pathlib import Path
 
 import einops
@@ -149,6 +151,16 @@ class RDPLatentDiffusionPolicy(PreTrainedPolicy):
         if self.config.env_state_feature:
             self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
 
+        # Reactive decoding state (RNN decoder with per-step temporal conditioning)
+        self._stored_latent_flat: Tensor | None = None
+        self._temporal_cond_buffer: list[Tensor] = []
+        self._reactive_decode_step: int = 0
+
+        # Background diffusion state: runs diffusion in a separate thread so the
+        # control loop is not blocked at chunk boundaries.
+        self._diffusion_future: Future | None = None
+        self._fallback_action: Tensor | None = None
+
     # ---- Latent statistics ----
 
     @torch.no_grad()
@@ -232,11 +244,167 @@ class RDPLatentDiffusionPolicy(PreTrainedPolicy):
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
         self._queues = populate_queues(self._queues, batch)
 
+        # Reactive decoding: diffusion runs once per chunk (slow), RNN decodes
+        # per step with fresh temporal conditioning observations (fast).
+        if self.config.at_decoder_type == "rnn" and self.config.at_temporal_cond_keys:
+            return self._select_action_reactive(batch, noise=noise)
+
+        # Non-reactive path (MLP decoder): decode all actions at once.
         if len(self._queues[ACTION]) == 0:
             actions = self.predict_action_chunk(batch, noise=noise)
             self._queues[ACTION].extend(actions.transpose(0, 1))
 
         return self._queues[ACTION].popleft()
+
+    def _select_action_reactive(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+        """Slow-fast inference with background diffusion.
+
+        Diffusion (slow) runs in a background thread so the control loop is not
+        blocked at chunk boundaries.  While diffusion is computing, the policy
+        returns the last decoded action as a fallback.
+
+        Flow:
+        1. First call ever: run diffusion synchronously (no fallback available).
+        2. Steps 1..N-1: decode from stored latent with fresh temporal cond (fast).
+        3. Step N (chunk exhausted): start diffusion in a background thread.
+        4. While background diffusion is running: return fallback action.
+        5. When background diffusion completes: swap in new latent and resume decoding.
+        """
+        step_cond = self._extract_step_temporal_cond(batch)
+
+        # --- Check if background diffusion completed ---
+        if self._diffusion_future is not None and self._diffusion_future.done():
+            self._stored_latent_flat = self._diffusion_future.result()
+            self._diffusion_future = None
+            self._reactive_decode_step = 0
+            self._temporal_cond_buffer = []
+
+        # --- First call: no latent and no pending diffusion → run synchronously ---
+        if self._stored_latent_flat is None and self._diffusion_future is None:
+            self._stored_latent_flat = self._diffuse_to_latent(batch, noise=noise)
+            self._reactive_decode_step = 0
+            self._temporal_cond_buffer = []
+
+        # --- Still waiting for background diffusion → return fallback ---
+        if self._stored_latent_flat is None:
+            if self._fallback_action is not None:
+                return self._fallback_action
+            # Edge case: no fallback yet (shouldn't happen, but block if it does)
+            self._stored_latent_flat = self._diffusion_future.result()
+            self._diffusion_future = None
+            self._reactive_decode_step = 0
+            self._temporal_cond_buffer = []
+
+        # --- Normal decode path ---
+        self._temporal_cond_buffer.append(step_cond)
+
+        # Build temporal conditioning: stack buffer + pad remaining to horizon
+        cond_stack = torch.stack(self._temporal_cond_buffer, dim=1)
+        n_have = cond_stack.shape[1]
+        horizon = self.config.horizon
+        if n_have < horizon:
+            pad = cond_stack[:, -1:, :].expand(-1, horizon - n_have, -1)
+            temporal_cond = torch.cat([cond_stack, pad], dim=1)
+        else:
+            temporal_cond = cond_stack[:, :horizon, :]
+
+        dec_out = self.at.decoder(self._stored_latent_flat, temporal_cond)
+        actions = einops.rearrange(
+            dec_out * self.config.at_act_scale, "N (T A) -> N T A", A=self.at.action_dim,
+        )
+
+        action_idx = self.config.n_obs_steps - 1 + self._reactive_decode_step
+        action = actions[:, action_idx]
+        self._fallback_action = action.clone()
+
+        self._reactive_decode_step += 1
+
+        # --- Chunk exhausted: start background diffusion ---
+        if self._reactive_decode_step >= self.config.n_action_steps:
+            self._start_background_diffusion(batch, noise)
+            self._stored_latent_flat = None
+            self._temporal_cond_buffer = []
+            self._reactive_decode_step = 0
+
+        return action
+
+    def _start_background_diffusion(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> None:
+        """Kick off diffusion in a daemon thread using the current observation queues."""
+        # Snapshot queue state so the background thread has its own copy
+        queues_snapshot = {
+            k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues
+        }
+        diffusion = self.diffusion
+        config = self.config
+        at = self.at
+
+        future: Future = Future()
+
+        def _run() -> None:
+            try:
+                with torch.no_grad():
+                    batch_size = queues_snapshot[OBS_STATE].shape[0]
+                    global_cond = diffusion._prepare_global_conditioning(queues_snapshot)
+                    latent = diffusion.conditional_sample(
+                        batch_size, global_cond=global_cond, noise=noise,
+                    )
+                    if diffusion.latent_stats_computed:
+                        latent = diffusion.unnormalize_latent(latent)
+
+                    latent_flat = einops.rearrange(latent, "N T A -> N (T A)")
+                    if config.at_use_vq:
+                        if config.use_latent_action_before_vq:
+                            state_vq, _, _ = at._quant_with_vq(latent_flat)
+                        else:
+                            state_vq = latent_flat
+                    else:
+                        state_vq = latent_flat
+                        state_vq = at._postprocess_quant_without_vq(state_vq)
+
+                future.set_result(state_vq)
+            except Exception as e:
+                future.set_exception(e)
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        self._diffusion_future = future
+
+    def _extract_step_temporal_cond(self, batch: dict[str, Tensor]) -> Tensor:
+        """Extract single-step temporal conditioning from current observation batch."""
+        parts = []
+        for key in self.config.at_temporal_cond_keys:
+            feat_key = f"observation.{key}" if not key.startswith("observation.") else key
+            val = batch[feat_key]
+            if val.dim() == 1:
+                val = val.unsqueeze(0)
+            parts.append(val)
+        return torch.cat(parts, dim=-1)  # (1, cond_dim)
+
+    def _diffuse_to_latent(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+        """Run diffusion and return the post-quantized latent (without decoding)."""
+        stacked = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
+        batch_size = stacked[OBS_STATE].shape[0]
+        global_cond = self.diffusion._prepare_global_conditioning(stacked)
+        latent = self.diffusion.conditional_sample(batch_size, global_cond=global_cond, noise=noise)
+
+        if self.diffusion.latent_stats_computed:
+            latent = self.diffusion.unnormalize_latent(latent)
+
+        # Process through AT quantization (same as _decode_from_latent, but stop before decoding)
+        latent_flat = einops.rearrange(latent, "N T A -> N (T A)")
+        config = self.config
+        at = self.at
+
+        if config.at_use_vq:
+            if config.use_latent_action_before_vq:
+                state_vq, _, _ = at._quant_with_vq(latent_flat)
+            else:
+                state_vq = latent_flat
+        else:
+            state_vq = latent_flat
+            state_vq = at._postprocess_quant_without_vq(state_vq)
+
+        return state_vq
 
     # ---- Training ----
 

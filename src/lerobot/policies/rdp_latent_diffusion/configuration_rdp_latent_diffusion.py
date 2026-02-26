@@ -105,6 +105,17 @@ class RDPLatentDiffusionConfig(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        # Coerce at_temporal_cond_keys: draccus may deserialize tuple[str, ...]
+        # from JSON as a plain string instead of a tuple.
+        if isinstance(self.at_temporal_cond_keys, str):
+            import json
+
+            try:
+                parsed = json.loads(self.at_temporal_cond_keys)
+                self.at_temporal_cond_keys = tuple(parsed)
+            except json.JSONDecodeError:
+                self.at_temporal_cond_keys = (self.at_temporal_cond_keys,)
+
         if not self.vision_backbone.startswith("resnet"):
             raise ValueError(f"vision_backbone must be a ResNet variant, got {self.vision_backbone}")
 

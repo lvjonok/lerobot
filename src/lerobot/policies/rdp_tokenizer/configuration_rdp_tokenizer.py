@@ -91,6 +91,17 @@ class RDPTokenizerConfig(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        # Coerce temporal_cond_keys: draccus may deserialize tuple[str, ...]
+        # from JSON as a plain string instead of a tuple.
+        if isinstance(self.temporal_cond_keys, str):
+            import json
+
+            try:
+                parsed = json.loads(self.temporal_cond_keys)
+                self.temporal_cond_keys = tuple(parsed)
+            except json.JSONDecodeError:
+                self.temporal_cond_keys = (self.temporal_cond_keys,)
+
         if self.encoder_type not in ("mlp", "conv1d"):
             raise ValueError(f"encoder_type must be 'mlp' or 'conv1d', got {self.encoder_type}")
         if self.decoder_type not in ("mlp", "rnn"):
