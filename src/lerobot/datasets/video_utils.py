@@ -238,16 +238,24 @@ class VideoDecoderCache:
             eviction and restores legacy unbounded behaviour. Defaults to the
             value of ``LEROBOT_VIDEO_DECODER_CACHE_SIZE`` if set, otherwise
             :data:`DEFAULT_DECODER_CACHE_SIZE`.
+        filesystem: Optional pre-configured ``fsspec`` filesystem used to open
+            video files. When provided, paths are opened via
+            ``filesystem.open(path)`` instead of ``fsspec.open(path)``; this lets
+            callers stream from a backend whose connection/credentials are baked
+            into the instance (e.g. an FTP/SFTP NAS share) without embedding
+            credentials in every path. ``None`` keeps the default behaviour of
+            resolving the protocol from the path itself (local files, ``hf://``).
     """
 
     _SENTINEL: ClassVar[object] = object()
 
-    def __init__(self, max_size: int | None | object = _SENTINEL):
+    def __init__(self, max_size: int | None | object = _SENTINEL, filesystem: Any | None = None):
         if max_size is VideoDecoderCache._SENTINEL:
             max_size = _default_max_cache_size()
         if max_size is not None and max_size <= 0:
             raise ValueError(f"max_size must be positive or None; got {max_size}")
         self.max_size: int | None = max_size  # type: ignore[assignment]
+        self.filesystem = filesystem
         self._cache: OrderedDict[str, tuple[Any, Any]] = OrderedDict()
         self._lock = Lock()
 
@@ -273,7 +281,8 @@ class VideoDecoderCache:
                 self._cache.move_to_end(video_path)
                 return entry[0]
 
-            file_handle = fsspec.open(video_path).__enter__()
+            opener = self.filesystem.open if self.filesystem is not None else fsspec.open
+            file_handle = opener(video_path).__enter__()
             try:
                 decoder = VideoDecoder(file_handle, seek_mode="approximate")
             except Exception:

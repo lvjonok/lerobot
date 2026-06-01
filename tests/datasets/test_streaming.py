@@ -13,16 +13,46 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import socket
+import threading
+
 import numpy as np
 import pytest
 import torch
 
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
-from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
+from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset, _remote_protocol
 from lerobot.datasets.utils import safe_shard
 from lerobot.utils.constants import ACTION
 from tests.fixtures.constants import DUMMY_REPO_ID
+
+
+def _free_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _serve_ftp(serve_dir, username="lerobot", password="lerobot"):
+    """Start a throwaway read-only FTP server in a daemon thread; return (server, port)."""
+    pyftpdlib = pytest.importorskip("pyftpdlib", reason="pyftpdlib is required for FTP streaming tests")
+    from pyftpdlib.authorizers import DummyAuthorizer
+    from pyftpdlib.handlers import FTPHandler
+    from pyftpdlib.servers import FTPServer
+
+    del pyftpdlib
+    port = _free_port()
+    authorizer = DummyAuthorizer()
+    authorizer.add_user(username, password, str(serve_dir), perm="elr")
+    handler = FTPHandler
+    handler.authorizer = authorizer
+    handler.passive_ports = range(60000, 60050)
+    server = FTPServer(("127.0.0.1", port), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, port
 
 
 def get_frames_expected_order(streaming_ds: StreamingLeRobotDataset) -> list[int]:
@@ -113,6 +143,106 @@ def test_single_frame_consistency(tmp_path, lerobot_dataset_factory):
         assert all(t[1] for t in key_checks), (
             f"Checking {list(filter(lambda t: not t[1], key_checks))[0][0]} left and right were found different (frame_idx: {frame_idx})"
         )
+
+
+@pytest.mark.parametrize(
+    "root, expected",
+    [
+        (None, None),
+        ("/local/path", None),
+        ("relative/path", None),
+        ("file:///local/path", None),
+        ("ftp://nas.local/datasets/my_ds", "ftp"),
+        ("ftp://user:pass@nas.local:2121/datasets/my_ds", "ftp"),
+        ("sftp://nas.local/datasets/my_ds", "sftp"),
+        ("s3://bucket/datasets/my_ds", "s3"),
+    ],
+)
+def test_remote_protocol(root, expected):
+    """A remote fsspec URL is recognized by its protocol; None / local paths are not."""
+    assert _remote_protocol(root) == expected
+
+
+def test_streaming_over_ftp_matches_local(tmp_path, lerobot_dataset_factory, monkeypatch):
+    """Streaming a dataset over ftp:// yields frames identical to local random access."""
+    import lerobot.datasets.streaming_dataset as streaming_mod
+
+    # keep the metadata mirror out of the real ~/.cache
+    monkeypatch.setattr(streaming_mod, "HF_LEROBOT_HOME", tmp_path / "cache")
+
+    ds_num_frames = 120
+    ds_num_episodes = 5
+    repo_id = f"{DUMMY_REPO_ID}-ftp"
+    local_path = tmp_path / "served" / "dataset"
+
+    ds = lerobot_dataset_factory(
+        root=local_path,
+        repo_id=repo_id,
+        total_episodes=ds_num_episodes,
+        total_frames=ds_num_frames,
+    )
+
+    server, port = _serve_ftp(tmp_path / "served")
+    try:
+        streaming_ds = StreamingLeRobotDataset(
+            repo_id=repo_id,
+            root=f"ftp://127.0.0.1:{port}/dataset",
+            storage_options={"username": "lerobot", "password": "lerobot"},
+            buffer_size=20,
+            shuffle=False,
+        )
+        assert streaming_ds.streaming_from_remote
+        assert not streaming_ds.streaming_from_local
+        assert streaming_ds.num_episodes == ds_num_episodes
+        assert streaming_ds.num_frames == ds_num_frames
+
+        n_checked = 0
+        for streaming_frame in streaming_ds:
+            target_frame = ds[streaming_frame["index"]]
+            assert set(streaming_frame.keys()) == set(target_frame.keys())
+            for key, left in streaming_frame.items():
+                right = target_frame[key]
+                if isinstance(left, str):
+                    assert left == right
+                elif isinstance(left, torch.Tensor):
+                    assert left.shape == right.shape
+                    assert torch.allclose(left, right)
+            n_checked += 1
+        assert n_checked == ds_num_frames
+    finally:
+        server.close_all()
+
+
+def test_streaming_over_ftp_credentials_from_env(tmp_path, lerobot_dataset_factory, monkeypatch):
+    """Credentials are picked up from fsspec env vars (FSSPEC_FTP_*) with no creds in the call."""
+    import fsspec.config
+
+    import lerobot.datasets.streaming_dataset as streaming_mod
+
+    monkeypatch.setattr(streaming_mod, "HF_LEROBOT_HOME", tmp_path / "cache")
+
+    repo_id = f"{DUMMY_REPO_ID}-ftp-env"
+    local_path = tmp_path / "served" / "dataset"
+    lerobot_dataset_factory(root=local_path, repo_id=repo_id, total_episodes=3, total_frames=60)
+
+    server, port = _serve_ftp(tmp_path / "served", username="robot", password="s3cret")
+    # creds live only in the environment — never in the URL or storage_options
+    monkeypatch.setenv("FSSPEC_FTP_USERNAME", "robot")
+    monkeypatch.setenv("FSSPEC_FTP_PASSWORD", "s3cret")
+    monkeypatch.setitem(fsspec.config.conf, "ftp", {})  # ensure a clean slate, restored by monkeypatch
+    fsspec.config.set_conf_env(fsspec.config.conf)  # env set after import -> refresh
+    try:
+        streaming_ds = StreamingLeRobotDataset(
+            repo_id=repo_id,
+            root=f"ftp://127.0.0.1:{port}/dataset",
+            buffer_size=10,
+            shuffle=False,
+        )
+        assert streaming_ds.streaming_from_remote
+        first = next(iter(streaming_ds))
+        assert first["index"] == 0
+    finally:
+        server.close_all()
 
 
 @pytest.mark.parametrize(
