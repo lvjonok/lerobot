@@ -346,8 +346,8 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                 - environment variables ``FSSPEC_<PROTOCOL>_<KWARG>`` (e.g.
                   ``FSSPEC_FTP_USERNAME`` / ``FSSPEC_FTP_PASSWORD``), or a JSON blob in
                   ``FSSPEC_<PROTOCOL>`` (e.g. ``FSSPEC_FTP='{"username": ..., "password": ...}'``);
-                - a per-protocol config file under ``~/.config/fsspec/`` (e.g.
-                  ``~/.config/fsspec/ftp.json`` containing ``{"username": ..., "password": ...}``).
+                - an fsspec config file under ``~/.config/fsspec/`` (any ``*.json``), keyed by
+                  protocol, e.g. ``{"ftp": {"username": ..., "password": ...}}``.
 
                 These are merged with anything passed here and with credentials parsed from the URL.
         """
