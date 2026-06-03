@@ -363,6 +363,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         self.streaming_from_local = root is not None and not self.streaming_from_remote
         self._remote_fs = None
         self._remote_path = None
+        self._remote_video_fs = None
 
         self.revision = revision if revision else CODEBASE_VERSION
 
@@ -384,6 +385,18 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             cache_dir = HF_LEROBOT_HOME / "remote" / cache_key
             self._requested_root = _mirror_remote_metadata(
                 self._remote_fs, self._remote_path, cache_dir, force=force_cache_sync
+            )
+            # Video files don't tolerate per-frame random-access ranged reads on every backend: the
+            # fsspec FTP backend aborts the in-flight transfer on each seek, which large multi-episode
+            # video files (and several camera decoders sharing one control connection) routinely turn
+            # into timeouts / connection resets. Wrap the video backend in fsspec's whole-file cache so
+            # each file is fetched once with a clean sequential transfer and then seeked locally by
+            # torchcodec. Metadata and parquet keep using the raw fs (small, mostly-sequential reads).
+            self._remote_video_fs = fsspec.filesystem(
+                "simplecache",
+                target_protocol=self.remote_protocol,
+                target_options=self._remote_conn,
+                cache_storage=str(cache_dir / "video_cache"),
             )
         else:
             self._requested_root = Path(root) if root else None
@@ -477,7 +490,8 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
     # in parallel, feeding a queue from which this iterator will yield processed items.
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
         if self.video_decoder_cache is None:
-            self.video_decoder_cache = VideoDecoderCache(filesystem=self._remote_fs)
+            # Use the whole-file-cached video backend for remote roots (see __init__).
+            self.video_decoder_cache = VideoDecoderCache(filesystem=self._remote_video_fs)
 
         # keep the same seed across exhaustions if shuffle is False, otherwise shuffle data across exhaustions
         rng = np.random.default_rng(self.seed) if not self.shuffle else self.rng
@@ -543,17 +557,21 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         return Backtrackable(dataset, history=lookback, lookahead=lookahead)
 
     def _make_timestamps_from_indices(
-        self, start_ts: float, indices: dict[str, list[int]] | None = None
+        self,
+        start_ts: float,
+        indices: dict[str, list[int]] | None = None,
+        offsets: dict[str, float] | None = None,
     ) -> dict[str, list[float]]:
+        offsets = offsets or {}
         if indices is not None:
             return {
                 key: (
-                    start_ts + torch.tensor(indices[key]) / self.fps
+                    offsets.get(key, 0.0) + start_ts + torch.tensor(indices[key]) / self.fps
                 ).tolist()  # NOTE: why not delta_timestamps directly?
                 for key in self.delta_timestamps
             }
         else:
-            return dict.fromkeys(self.meta.video_keys, [start_ts])
+            return {key: [offsets.get(key, 0.0) + start_ts] for key in self.meta.video_keys}
 
     def _make_padding_camera_frame(self, camera_key: str):
         """Variable-shape padding frame for given camera keys, given in (H, W, C)"""
@@ -596,8 +614,12 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         # Get episode index from the item
         ep_idx = item["episode_index"]
 
-        # "timestamp" restarts from 0 for each episode, whereas we need a global timestep within the single .mp4 file (given by index/fps)
-        current_ts = item["index"] / self.fps
+        # `timestamp` restarts from 0 each episode. The in-file position of a frame is the episode's
+        # video offset (`from_timestamp`) plus this episode-relative timestamp -- using the global
+        # `index / fps` only works when a camera is stored as a single monolithic video file, and
+        # overshoots once episodes are packed into chunked, multi-episode video files. The per-key
+        # offset is applied in `_get_query_timestamps` / `_make_timestamps_from_indices`.
+        current_ts = item["timestamp"]
 
         episode_boundaries_ts = {
             key: (
@@ -615,7 +637,11 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
         # Load video frames, when needed
         if len(self.meta.video_keys) > 0:
-            original_timestamps = self._make_timestamps_from_indices(current_ts, self.delta_indices)
+            # Per-camera in-file offset: episodes may be packed into multi-episode video files.
+            video_ts_offsets = {key: episode_boundaries_ts[key][0] for key in self.meta.video_keys}
+            original_timestamps = self._make_timestamps_from_indices(
+                current_ts, self.delta_indices, video_ts_offsets
+            )
 
             # Some timestamps might not result available considering the episode's boundaries
             query_timestamps = self._get_query_timestamps(
@@ -651,8 +677,15 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         query_indices: dict[str, list[int]] | None = None,
         episode_boundaries_ts: dict[str, tuple[float, float]] | None = None,
     ) -> dict[str, list[float]]:
+        # Episodes can be packed into multi-episode video files, so the in-file timestamp of a frame
+        # is the episode's `from_timestamp` offset plus the episode-relative `current_ts`.
+        offsets = (
+            {key: episode_boundaries_ts[key][0] for key in self.meta.video_keys}
+            if episode_boundaries_ts is not None
+            else None
+        )
         query_timestamps = {}
-        keys_to_timestamps = self._make_timestamps_from_indices(current_ts, query_indices)
+        keys_to_timestamps = self._make_timestamps_from_indices(current_ts, query_indices, offsets)
         for key in self.meta.video_keys:
             if query_indices is not None and key in query_indices:
                 timestamps = keys_to_timestamps[key]
@@ -662,7 +695,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                 ).tolist()
 
             else:
-                query_timestamps[key] = [current_ts]
+                query_timestamps[key] = keys_to_timestamps[key]
 
         return query_timestamps
 
