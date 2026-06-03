@@ -13,14 +13,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import re
+import shutil
 from collections import deque
 from collections.abc import Callable, Generator, Iterable, Iterator
 from pathlib import Path
 
 import datasets
+import fsspec
 import numpy as np
 import torch
 from datasets import load_dataset
+from fsspec.core import split_protocol, url_to_fs
 
 from lerobot.utils.constants import HF_LEROBOT_HOME, LOOKAHEAD_BACKTRACKTABLE, LOOKBACK_BACKTRACKTABLE
 
@@ -197,6 +201,62 @@ class Backtrackable[T]:
             return False
 
 
+def _remote_protocol(root: str | Path | None) -> str | None:
+    """Return the fsspec protocol if ``root`` is a remote (non-local) URL, else ``None``.
+
+    A remote root (e.g. ``ftp://``, ``sftp://``, ``smb://``, ``s3://``) is neither a Hub ``repo_id``
+    nor a local directory, so it gets its own streaming path. ``None``, local paths and ``file://``
+    URLs return ``None``.
+    """
+    if not isinstance(root, str):
+        return None
+    protocol, _ = split_protocol(root)
+    if protocol in (None, "file", "local"):
+        return None
+    return protocol
+
+
+def _mirror_remote_metadata(fs, remote_path: str, cache_dir: Path, force: bool = False) -> Path:
+    """Mirror the small ``meta/`` tree from a remote share into a local cache directory.
+
+    The metadata loaders read from local disk, so we copy ``meta/`` once and then reuse the
+    existing local-disk code path. Data and video files are never copied — they stream lazily.
+    """
+    meta_local = cache_dir / "meta"
+    if force or not (meta_local / "info.json").exists():
+        if meta_local.exists():
+            shutil.rmtree(meta_local)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        fs.get(f"{remote_path}/meta", str(meta_local), recursive=True)
+    return cache_dir
+
+
+def _make_remote_parquet_iterable(
+    protocol: str, conn: dict, files: list[str], batch_size: int = 64
+) -> datasets.IterableDataset:
+    """Stream remote parquet shards into an ``IterableDataset`` via fsspec + pyarrow.
+
+    HF ``datasets`` cannot glob/stream arbitrary fsspec URLs (its streaming path assumes the Hub),
+    so we glob the shard list ourselves and read each parquet file over an fsspec handle. The file
+    list is passed as a ``gen_kwargs`` list, which lets ``datasets`` shard the dataset (one shard
+    per file) and stay picklable for multi-worker loading.
+    """
+    import pyarrow.parquet as pq
+
+    def _gen(files: list[str], protocol: str, conn: dict, batch_size: int):
+        fs = fsspec.filesystem(protocol, **conn)
+        for file in files:
+            # Stream row groups lazily rather than loading the whole (~100 MB) file into memory.
+            with fs.open(file) as handle:
+                for batch in pq.ParquetFile(handle).iter_batches(batch_size=batch_size):
+                    yield from batch.to_pylist()
+
+    return datasets.IterableDataset.from_generator(
+        _gen,
+        gen_kwargs={"files": files, "protocol": protocol, "conn": conn, "batch_size": batch_size},
+    )
+
+
 class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
     """LeRobotDataset with streaming capabilities.
 
@@ -252,14 +312,20 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         rng: np.random.Generator | None = None,
         shuffle: bool = True,
         return_uint8: bool = False,
+        storage_options: dict | None = None,
     ):
         """Initialize a StreamingLeRobotDataset.
 
         Args:
             repo_id (str): This is the repo id that will be used to fetch the dataset.
-            root (Path | None, optional): Local directory to use for local datasets. When omitted, Hub
-                metadata is resolved through a revision-safe snapshot cache under
-                ``$HF_LEROBOT_HOME/hub``.
+            root (str | Path | None, optional): Where the dataset lives. Three cases:
+                - ``None``: stream from the Hugging Face Hub using ``repo_id``.
+                - a local directory: stream from local files.
+                - a remote fsspec URL (``ftp://``, ``sftp://``, ``smb://``, ``s3://``, ...): stream
+                  from that backend (e.g. a NAS share). ``repo_id`` is then just a local label and
+                  the URL points at the dataset root. Metadata is mirrored locally once; data and
+                  videos stream lazily. When omitted, Hub metadata is resolved through a
+                  revision-safe snapshot cache under ``$HF_LEROBOT_HOME/hub``.
             episodes (list[int] | None, optional): If specified, this will only load episodes specified by
                 their episode_index in this list.
             image_transforms (Callable | None, optional): Transform to apply to image data.
@@ -272,17 +338,74 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             seed (int, optional): Reproducibility random seed.
             rng (np.random.Generator | None, optional): Random number generator.
             shuffle (bool, optional): Whether to shuffle the dataset across exhaustions. Defaults to True.
+            storage_options (dict | None, optional): Extra fsspec connection options for a remote
+                ``root`` (e.g. ``{"username": ..., "password": ...}`` for FTP/SFTP). Ignored for Hub
+                and local-disk roots. Credentials are resolved by fsspec from several sources, so
+                they need not be hard-coded — prefer one of the following over passing them here:
+
+                - environment variables ``FSSPEC_<PROTOCOL>_<KWARG>`` (e.g.
+                  ``FSSPEC_FTP_USERNAME`` / ``FSSPEC_FTP_PASSWORD``), or a JSON blob in
+                  ``FSSPEC_<PROTOCOL>`` (e.g. ``FSSPEC_FTP='{"username": ..., "password": ...}'``);
+                - an fsspec config file under ``~/.config/fsspec/`` (any ``*.json``), keyed by
+                  protocol, e.g. ``{"ftp": {"username": ..., "password": ...}}``.
+
+                These are merged with anything passed here and with credentials parsed from the URL.
         """
         super().__init__()
         self.repo_id = repo_id
-        self._requested_root = Path(root) if root else None
+        self.storage_options = storage_options or {}
+
+        # Three streaming sources: Hub (root is None), a local directory, or a remote fsspec
+        # backend (ftp/sftp/smb/s3/...). A remote root is neither local nor Hub and gets its own
+        # path: metadata mirrored locally once, data + videos streamed over an fsspec filesystem.
+        self.remote_protocol = _remote_protocol(root)
+        self.streaming_from_remote = self.remote_protocol is not None
+        self.streaming_from_local = root is not None and not self.streaming_from_remote
+        self._remote_fs = None
+        self._remote_path = None
+        self._remote_video_fs = None
+
+        self.revision = revision if revision else CODEBASE_VERSION
+
+        if self.streaming_from_remote:
+            # url_to_fs resolves the backend and the backend-relative path correctly per protocol
+            # (e.g. host-based ftp:// vs bucket-based s3://). Credentials parsed from the URL are
+            # merged with storage_options; keeping them out of storage_options' ``host`` avoids
+            # fsspec's "multiple values for 'host'" collision.
+            self._remote_fs, self._remote_path = url_to_fs(root, **self.storage_options)
+            self._remote_conn = dict(self._remote_fs.storage_options)
+            # Mirror the small meta/ tree into a local cache and load it from disk. Key the cache by
+            # the remote location (protocol + host + path), not by repo_id, so two datasets that
+            # share a repo_id label but live at different URLs never reuse each other's metadata.
+            cache_key = re.sub(
+                r"[^A-Za-z0-9._-]+",
+                "_",
+                f"{self.remote_protocol}_{self._remote_conn.get('host', '')}_{self._remote_path}".strip("/"),
+            )
+            cache_dir = HF_LEROBOT_HOME / "remote" / cache_key
+            self._requested_root = _mirror_remote_metadata(
+                self._remote_fs, self._remote_path, cache_dir, force=force_cache_sync
+            )
+            # Video files don't tolerate per-frame random-access ranged reads on every backend: the
+            # fsspec FTP backend aborts the in-flight transfer on each seek, which large multi-episode
+            # video files (and several camera decoders sharing one control connection) routinely turn
+            # into timeouts / connection resets. Wrap the video backend in fsspec's whole-file cache so
+            # each file is fetched once with a clean sequential transfer and then seeked locally by
+            # torchcodec. Metadata and parquet keep using the raw fs (small, mostly-sequential reads).
+            self._remote_video_fs = fsspec.filesystem(
+                "simplecache",
+                target_protocol=self.remote_protocol,
+                target_options=self._remote_conn,
+                cache_storage=str(cache_dir / "video_cache"),
+            )
+        else:
+            self._requested_root = Path(root) if root else None
+
         self.root = self._requested_root if self._requested_root is not None else HF_LEROBOT_HOME / repo_id
-        self.streaming_from_local = root is not None
 
         self.image_transforms = image_transforms
         self.episodes = episodes
         self.tolerance_s = tolerance_s
-        self.revision = revision if revision else CODEBASE_VERSION
         self.seed = seed
         self.rng = rng if rng is not None else np.random.default_rng(seed)
         self.shuffle = shuffle
@@ -294,10 +417,11 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         # We cache the video decoders to avoid re-initializing them at each frame (avoiding a ~10x slowdown)
         self.video_decoder_cache = None
 
-        if self._requested_root is not None:
+        if self._requested_root is not None and not self.streaming_from_remote:
             self.root.mkdir(exist_ok=True, parents=True)
 
-        # Load metadata
+        # Load metadata. For a remote root we pass the local mirror directory, so the existing
+        # local-disk loaders are used and no Hub download is attempted.
         self.meta = LeRobotDatasetMetadata(
             self.repo_id, self._requested_root, self.revision, force_cache_sync=force_cache_sync
         )
@@ -314,13 +438,25 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             self.delta_timestamps = delta_timestamps
             self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
 
-        self.hf_dataset: datasets.IterableDataset = load_dataset(
-            self.repo_id if not self.streaming_from_local else str(self.root),
-            split="train",
-            streaming=self.streaming,
-            data_files="data/*/*.parquet",
-            revision=self.revision,
-        )
+        if self.streaming_from_remote:
+            # HF datasets cannot stream arbitrary fsspec URLs, so glob the parquet shards ourselves
+            # and read them over the fsspec filesystem.
+            parquet_files = sorted(self._remote_fs.glob(f"{self._remote_path}/data/*/*.parquet"))
+            if not parquet_files:
+                raise FileNotFoundError(
+                    f"No parquet files found at {self.remote_protocol}://{self._remote_path}/data/*/*.parquet"
+                )
+            self.hf_dataset = _make_remote_parquet_iterable(
+                self.remote_protocol, self._remote_conn, parquet_files
+            )
+        else:
+            self.hf_dataset: datasets.IterableDataset = load_dataset(
+                self.repo_id if not self.streaming_from_local else str(self.root),
+                split="train",
+                streaming=self.streaming,
+                data_files="data/*/*.parquet",
+                revision=self.revision,
+            )
 
         self.num_shards = min(self.hf_dataset.num_shards, max_num_shards)
 
@@ -354,7 +490,8 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
     # in parallel, feeding a queue from which this iterator will yield processed items.
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
         if self.video_decoder_cache is None:
-            self.video_decoder_cache = VideoDecoderCache()
+            # Use the whole-file-cached video backend for remote roots (see __init__).
+            self.video_decoder_cache = VideoDecoderCache(filesystem=self._remote_video_fs)
 
         # keep the same seed across exhaustions if shuffle is False, otherwise shuffle data across exhaustions
         rng = np.random.default_rng(self.seed) if not self.shuffle else self.rng
@@ -420,17 +557,21 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         return Backtrackable(dataset, history=lookback, lookahead=lookahead)
 
     def _make_timestamps_from_indices(
-        self, start_ts: float, indices: dict[str, list[int]] | None = None
+        self,
+        start_ts: float,
+        indices: dict[str, list[int]] | None = None,
+        offsets: dict[str, float] | None = None,
     ) -> dict[str, list[float]]:
+        offsets = offsets or {}
         if indices is not None:
             return {
                 key: (
-                    start_ts + torch.tensor(indices[key]) / self.fps
+                    offsets.get(key, 0.0) + start_ts + torch.tensor(indices[key]) / self.fps
                 ).tolist()  # NOTE: why not delta_timestamps directly?
                 for key in self.delta_timestamps
             }
         else:
-            return dict.fromkeys(self.meta.video_keys, [start_ts])
+            return {key: [offsets.get(key, 0.0) + start_ts] for key in self.meta.video_keys}
 
     def _make_padding_camera_frame(self, camera_key: str):
         """Variable-shape padding frame for given camera keys, given in (H, W, C)"""
@@ -473,8 +614,12 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         # Get episode index from the item
         ep_idx = item["episode_index"]
 
-        # "timestamp" restarts from 0 for each episode, whereas we need a global timestep within the single .mp4 file (given by index/fps)
-        current_ts = item["index"] / self.fps
+        # `timestamp` restarts from 0 each episode. The in-file position of a frame is the episode's
+        # video offset (`from_timestamp`) plus this episode-relative timestamp -- using the global
+        # `index / fps` only works when a camera is stored as a single monolithic video file, and
+        # overshoots once episodes are packed into chunked, multi-episode video files. The per-key
+        # offset is applied in `_get_query_timestamps` / `_make_timestamps_from_indices`.
+        current_ts = item["timestamp"]
 
         episode_boundaries_ts = {
             key: (
@@ -492,7 +637,11 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
         # Load video frames, when needed
         if len(self.meta.video_keys) > 0:
-            original_timestamps = self._make_timestamps_from_indices(current_ts, self.delta_indices)
+            # Per-camera in-file offset: episodes may be packed into multi-episode video files.
+            video_ts_offsets = {key: episode_boundaries_ts[key][0] for key in self.meta.video_keys}
+            original_timestamps = self._make_timestamps_from_indices(
+                current_ts, self.delta_indices, video_ts_offsets
+            )
 
             # Some timestamps might not result available considering the episode's boundaries
             query_timestamps = self._get_query_timestamps(
@@ -528,8 +677,15 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         query_indices: dict[str, list[int]] | None = None,
         episode_boundaries_ts: dict[str, tuple[float, float]] | None = None,
     ) -> dict[str, list[float]]:
+        # Episodes can be packed into multi-episode video files, so the in-file timestamp of a frame
+        # is the episode's `from_timestamp` offset plus the episode-relative `current_ts`.
+        offsets = (
+            {key: episode_boundaries_ts[key][0] for key in self.meta.video_keys}
+            if episode_boundaries_ts is not None
+            else None
+        )
         query_timestamps = {}
-        keys_to_timestamps = self._make_timestamps_from_indices(current_ts, query_indices)
+        keys_to_timestamps = self._make_timestamps_from_indices(current_ts, query_indices, offsets)
         for key in self.meta.video_keys:
             if query_indices is not None and key in query_indices:
                 timestamps = keys_to_timestamps[key]
@@ -539,7 +695,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                 ).tolist()
 
             else:
-                query_timestamps[key] = [current_ts]
+                query_timestamps[key] = keys_to_timestamps[key]
 
         return query_timestamps
 
@@ -552,7 +708,13 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
         item = {}
         for video_key, query_ts in query_timestamps.items():
-            root = self.meta.url_root if self.streaming and not self.streaming_from_local else self.root
+            if self.streaming_from_remote:
+                # fsspec-relative path; opened via self._remote_fs (credentials baked into the instance)
+                root = self._remote_path
+            elif self.streaming and not self.streaming_from_local:
+                root = self.meta.url_root
+            else:
+                root = self.root
             video_path = f"{root}/{self.meta.get_video_file_path(ep_idx, video_key)}"
             frames = decode_video_frames_torchcodec(
                 video_path,
