@@ -174,6 +174,13 @@ class DAggerStrategyConfig(RolloutStrategyConfig):
     2. **correction** — toggle human correction recording.
     3. **upload** — push dataset to hub on demand (corrections-only mode).
 
+    ``input_device="teleop"`` lets the teleoperator itself start and end a correction: while
+    its ``get_teleop_events()`` reports ``TeleopEvents.IS_INTERVENTION`` the human drives and
+    the frames are recorded, from whatever phase the rollout was in; when it stops, the
+    correction ends and the robot holds.  Meant for clutch-style teleops (a VR trigger, a
+    haptic device's button), with ``smooth_handover=false``.  The keyboard still stops the
+    session (ESC), resumes the policy (``pause_resume``) and uploads.
+
     When ``record_autonomous=False`` (default) only human-correction windows
     are recorded — each correction becomes its own episode.  Set to ``True``
     to record both autonomous and correction frames with size-based episode
@@ -202,8 +209,10 @@ class DAggerStrategyConfig(RolloutStrategyConfig):
     pedal: DAggerPedalConfig = field(default_factory=DAggerPedalConfig)
 
     def __post_init__(self):
-        if self.input_device not in ("keyboard", "pedal"):
-            raise ValueError(f"DAgger input_device must be 'keyboard' or 'pedal', got '{self.input_device}'")
+        if self.input_device not in ("keyboard", "pedal", "teleop"):
+            raise ValueError(
+                f"DAgger input_device must be 'keyboard', 'pedal' or 'teleop', got '{self.input_device}'"
+            )
 
 
 # ---------------------------------------------------------------------------

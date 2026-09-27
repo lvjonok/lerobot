@@ -156,6 +156,7 @@ from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.cameras.zmq import ZMQCameraConfig  # noqa: F401
 from lerobot.configs import parser
+from lerobot.processor import RobotProcessorPipeline
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
@@ -200,8 +201,18 @@ logger = logging.getLogger(__name__)
 
 
 @parser.wrap()
-def rollout(cfg: RolloutConfig):
-    """Main entry point for policy deployment."""
+def rollout(
+    cfg: RolloutConfig,
+    teleop_action_processor: RobotProcessorPipeline | None = None,
+    robot_action_processor: RobotProcessorPipeline | None = None,
+    robot_observation_processor: RobotProcessorPipeline | None = None,
+):
+    """Main entry point for policy deployment.
+
+    The processors are for callers that need their own, as ``record()`` takes them: a teleop
+    whose raw action is not a robot action (a clutch delta, say) passes the pipeline that
+    makes it one.  ``None`` keeps LeRobot's defaults.
+    """
     init_logging()
 
     if cfg.display_data:
@@ -217,7 +228,13 @@ def rollout(cfg: RolloutConfig):
     shutdown_event = signal_handler.shutdown_event
 
     logger.info("Building rollout context...")
-    ctx = build_rollout_context(cfg, shutdown_event)
+    ctx = build_rollout_context(
+        cfg,
+        shutdown_event,
+        teleop_action_processor=teleop_action_processor,
+        robot_action_processor=robot_action_processor,
+        robot_observation_processor=robot_observation_processor,
+    )
 
     strategy = create_strategy(cfg.strategy)
     logger.info("Rollout strategy: %s", cfg.strategy.type)

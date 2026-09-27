@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from contextlib import nullcontext
 from copy import copy
 
@@ -24,26 +25,25 @@ import torch
 
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import make_robot_action, prepare_observation_for_inference
-from lerobot.processor import PolicyProcessorPipeline
+from lerobot.processor import PolicyProcessorPipeline, RelativeActionsProcessorStep
 
 from .base import InferenceEngine
 
 logger = logging.getLogger(__name__)
 
 
-# TODO(Steven): support relative-action policies.  The per-tick flow refreshes
-# ``RelativeActionsProcessorStep._last_state`` every call, so cached chunk
-# actions popped on later ticks get reanchored to the *current* robot state and
-# absolute targets drift through the chunk.  Relative-action policies are
-# rejected at context-build time today; RTC postprocesses the whole chunk and
-# is unaffected.
-#
-# Candidate fix: drive the policy via ``predict_action_chunk`` and serve a
-# local FIFO of postprocessed actions.  Eliminates drift by construction and
-# saves per-tick pre/post work, but bypasses ``select_action`` — needs
-# fallbacks for SAC (raises), ACT temporal ensembling (ensembler lives in
-# ``select_action``), and Diffusion-family (obs-history queues populated as a
-# side effect of ``select_action``).
+# Relative-action policies run whole chunks.  The per-tick flow refreshes
+# ``RelativeActionsProcessorStep._last_state`` every call, so chunk actions
+# queued inside ``select_action`` and popped on later ticks would be re-anchored
+# to the *current* robot state and the absolute targets would drift through the
+# chunk.  Instead the engine preprocesses one observation, predicts the whole
+# chunk with ``predict_action_chunk``, postprocesses it at once against that
+# observation's anchor, and serves the first ``n_action_steps`` from a local
+# FIFO.  This bypasses ``select_action``, so the two policies that need it are
+# refused: ACT with temporal ensembling (the ensembler lives in
+# ``select_action``, and it would average chunks anchored at different states),
+# and policies with observation-history queues (the Diffusion family fills
+# ``_queues`` as a side effect of ``select_action``).
 
 
 class SyncInferenceEngine(InferenceEngine):
@@ -73,10 +73,27 @@ class SyncInferenceEngine(InferenceEngine):
         self._task = task
         self._device = torch.device(device or "cpu")
         self._robot_type = robot_type
+        self._relative = any(
+            isinstance(step, RelativeActionsProcessorStep) and step.enabled
+            for step in getattr(preprocessor, "steps", ())
+        )
+        self._chunk: deque[torch.Tensor] = deque()
+        if self._relative:
+            if getattr(policy.config, "temporal_ensemble_coeff", None) is not None:
+                raise ValueError(
+                    "Relative-action policies run whole chunks; temporal ensembling would average "
+                    "chunks anchored at different states. Set temporal_ensemble_coeff to None."
+                )
+            if hasattr(policy, "_queues"):
+                raise NotImplementedError(
+                    f"SyncInferenceEngine does not support relative-action policies with "
+                    f"observation-history queues ({type(policy).__name__}) yet."
+                )
         logger.info(
-            "SyncInferenceEngine initialized (device=%s, action_keys=%d)",
+            "SyncInferenceEngine initialized (device=%s, action_keys=%d, relative=%s)",
             self._device,
             len(ordered_action_keys),
+            self._relative,
         )
 
     def start(self) -> None:
@@ -93,11 +110,20 @@ class SyncInferenceEngine(InferenceEngine):
         self._policy.reset()
         self._preprocessor.reset()
         self._postprocessor.reset()
+        self._chunk.clear()
 
     def get_action(self, obs_frame: dict | None) -> torch.Tensor | None:
-        """Run the full inference pipeline on ``obs_frame`` and return an action tensor."""
+        """Run the full inference pipeline on ``obs_frame`` and return an action tensor.
+
+        For a relative-action policy, the next action of the current chunk; a new chunk is
+        predicted from ``obs_frame`` only when the last one is used up.
+        """
         if obs_frame is None:
             return None
+        if self._relative:
+            if not self._chunk:
+                self._chunk.extend(self._predict_chunk(obs_frame))
+            return self._reorder(self._chunk.popleft())
         # Shallow copy is intentional: the caller (`send_next_action`) builds
         # ``obs_frame`` fresh per tick via ``build_dataset_frame``, so the
         # tensor/array values are not shared with any other reader.
@@ -114,9 +140,33 @@ class SyncInferenceEngine(InferenceEngine):
             observation = self._preprocessor(observation)
             action = self._policy.select_action(observation)
             action = self._postprocessor(action)
-        action_tensor = action.squeeze(0).cpu()
+        return self._reorder(action.squeeze(0).cpu())
 
-        # Reorder to match dataset action ordering so the caller can treat
-        # the returned tensor uniformly across backends.
+    def _predict_chunk(self, obs_frame: dict) -> list[torch.Tensor]:
+        """Predict one chunk and make it absolute against this observation's anchor.
+
+        Returns:
+            The first ``n_action_steps`` actions, each ``(action_dim,)`` on the CPU.
+        """
+        observation = copy(obs_frame)
+        autocast_ctx = (
+            torch.autocast(device_type=self._device.type)
+            if self._device.type == "cuda" and self._policy.config.use_amp
+            else nullcontext()
+        )
+        with torch.inference_mode(), autocast_ctx:
+            observation = prepare_observation_for_inference(
+                observation, self._device, self._task, self._robot_type
+            )
+            # The relative step caches this observation's state; the postprocessor below composes
+            # the chunk onto it before any later observation can replace it.
+            observation = self._preprocessor(observation)
+            chunk = self._policy.predict_action_chunk(observation)
+            steps = getattr(self._policy.config, "n_action_steps", None) or chunk.shape[1]
+            chunk = self._postprocessor(chunk[:, :steps])
+        return list(chunk.squeeze(0).float().cpu())
+
+    def _reorder(self, action_tensor: torch.Tensor) -> torch.Tensor:
+        """Reorder to the dataset action ordering, so callers treat every backend alike."""
         action_dict = make_robot_action(action_tensor, self._dataset_features)
         return torch.tensor([action_dict[k] for k in self._ordered_action_keys])

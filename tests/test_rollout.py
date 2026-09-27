@@ -76,7 +76,7 @@ def test_strategy_config_types():
 def test_dagger_config_invalid_input_device():
     from lerobot.rollout import DAggerStrategyConfig
 
-    with pytest.raises(ValueError, match="input_device must be 'keyboard' or 'pedal'"):
+    with pytest.raises(ValueError, match="input_device must be 'keyboard', 'pedal' or 'teleop'"):
         DAggerStrategyConfig(input_device="joystick")
 
 
@@ -363,6 +363,104 @@ def test_create_inference_engine_sync():
     assert isinstance(engine, SyncInferenceEngine)
 
 
+class _ChunkPolicy:
+    """Predicts ``±[1, 2, 3, ...] * 0.1`` as a chunk of relative steps, counting its calls."""
+
+    def __init__(self, chunk_size=5, n_action_steps=3, **config):
+        self.config = SimpleNamespace(
+            n_action_steps=n_action_steps, use_amp=False, temporal_ensemble_coeff=None, **config
+        )
+        self.chunk_size = chunk_size
+        self.calls = 0
+
+    def reset(self):
+        pass
+
+    def predict_action_chunk(self, batch):
+        self.calls += 1
+        steps = torch.arange(1, self.chunk_size + 1, dtype=torch.float32) * 0.1
+        return torch.stack([steps, -steps], dim=-1).unsqueeze(0)
+
+
+class _AnchorPre:
+    """Stands in for a preprocessor holding an enabled relative step: caches the state."""
+
+    def __init__(self):
+        from lerobot.processor import RelativeActionsProcessorStep
+
+        self.steps = [RelativeActionsProcessorStep(enabled=True)]
+        self.anchor = None
+
+    def __call__(self, observation):
+        self.anchor = observation["observation.state"].clone()
+        return observation
+
+    def reset(self):
+        pass
+
+
+class _AnchorPost:
+    """Composes a relative chunk onto the anchor the preprocessor cached."""
+
+    def __init__(self, pre):
+        self.pre = pre
+
+    def __call__(self, action):
+        return action + self.pre.anchor.view(1, 1, -1)
+
+    def reset(self):
+        pass
+
+
+def _relative_engine(policy):
+    from lerobot.rollout import SyncInferenceEngine
+
+    pre = _AnchorPre()
+    return SyncInferenceEngine(
+        policy=policy,
+        preprocessor=pre,
+        postprocessor=_AnchorPost(pre),
+        dataset_features={"action": {"names": ["x", "y"]}},
+        ordered_action_keys=["x", "y"],
+        task="test",
+        device="cpu",
+        robot_type="mock",
+    )
+
+
+def test_sync_relative_policy_runs_whole_chunks_on_one_anchor():
+    """A chunk's actions are composed onto the state it was predicted from, not a later one."""
+    import numpy as np
+
+    policy = _ChunkPolicy(chunk_size=5, n_action_steps=3)
+    engine = _relative_engine(policy)
+    served = []
+    for tick in range(6):
+        # The arm moves between ticks; only the observation a chunk starts from anchors it.
+        state = np.array([10.0 * tick, 0.0], dtype=np.float32)
+        served.append(engine.get_action({"observation.state": state}).tolist())
+
+    assert policy.calls == 2, "one prediction per n_action_steps"
+    expected = [[0.1, -0.1], [0.2, -0.2], [0.3, -0.3], [30.1, -0.1], [30.2, -0.2], [30.3, -0.3]]
+    assert served == [pytest.approx(row) for row in expected]
+
+    engine.reset()
+    engine.get_action({"observation.state": np.array([50.0, 0.0], dtype=np.float32)})
+    assert policy.calls == 3, "reset drops the rest of the chunk"
+
+
+def test_sync_relative_policy_refuses_temporal_ensembling_and_history_queues():
+    ensembling = _ChunkPolicy()
+    ensembling.config.temporal_ensemble_coeff = 0.01
+    with pytest.raises(ValueError, match="temporal ensembling"):
+        _relative_engine(ensembling)
+
+    queued = _ChunkPolicy()
+    queued._queues = {}
+    with pytest.raises(NotImplementedError, match="observation-history"):
+        _relative_engine(queued)
+
+
 # ---------------------------------------------------------------------------
 # Pure functions
 # ---------------------------------------------------------------------------
@@ -427,6 +525,29 @@ def test_dagger_full_transition_cycle():
     events.request_transition("pause_resume")
     old, new = events.consume_transition()
     assert (old, new) == (DAggerPhase.PAUSED, DAggerPhase.AUTONOMOUS)
+
+
+def test_dagger_teleop_intervention_takes_over_from_any_phase_and_release_holds():
+    from lerobot.rollout.strategies import DAggerEvents, DAggerPhase
+
+    auto, paused, corr = DAggerPhase.AUTONOMOUS, DAggerPhase.PAUSED, DAggerPhase.CORRECTING
+    events = DAggerEvents()
+    assert events.follow_intervention(False) == []
+    # Pressed while the policy drives: through PAUSED, so both steps' side effects run.
+    assert events.follow_intervention(True) == [(auto, paused), (paused, corr)]
+    assert events.follow_intervention(True) == [], "held: stays correcting"
+    # Released: the correction ends and the robot holds; the policy does not resume.
+    assert events.follow_intervention(False) == [(corr, paused)]
+    assert events.phase == paused
+    assert events.follow_intervention(False) == []
+    # Pressed again from the hold.
+    assert events.follow_intervention(True) == [(paused, corr)]
+
+
+def test_dagger_config_accepts_teleop_input():
+    from lerobot.rollout import DAggerStrategyConfig
+
+    assert DAggerStrategyConfig(input_device="teleop").input_device == "teleop"
 
 
 def test_dagger_invalid_transition_ignored():

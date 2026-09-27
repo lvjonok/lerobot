@@ -61,6 +61,7 @@ from lerobot.common.control_utils import (
 )
 from lerobot.datasets import VideoEncodingManager
 from lerobot.datasets.utils import DEFAULT_VIDEO_FILE_SIZE_IN_MB
+from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame
 from lerobot.utils.keyboard_input import create_key_listener
@@ -135,6 +136,26 @@ class DAggerEvents:
         with self._lock:
             if (self._phase, event) in _DAGGER_TRANSITIONS:
                 self._pending_transition = event
+
+    def follow_intervention(self, active: bool) -> list[tuple[DAggerPhase, DAggerPhase]]:
+        """Move to the phase a teleop's intervention signal asks for (``input_device="teleop"``).
+
+        ``active`` from AUTONOMOUS or PAUSED goes to CORRECTING -- through PAUSED, so the side
+        effects of both steps run; inactive from CORRECTING goes to PAUSED. Anything else
+        stays. Returns the transitions taken, in order, for the caller to apply.
+        """
+        with self._lock:
+            path: list[tuple[DAggerPhase, DAggerPhase]] = []
+            if active and self._phase == DAggerPhase.AUTONOMOUS:
+                path.append((DAggerPhase.AUTONOMOUS, DAggerPhase.PAUSED))
+            if active and self._phase in (DAggerPhase.AUTONOMOUS, DAggerPhase.PAUSED):
+                path.append((DAggerPhase.PAUSED, DAggerPhase.CORRECTING))
+            if not active and self._phase == DAggerPhase.CORRECTING:
+                path.append((DAggerPhase.CORRECTING, DAggerPhase.PAUSED))
+            if path:
+                self._phase = path[-1][1]
+                self._pending_transition = None
+            return path
 
     def consume_transition(self) -> tuple[DAggerPhase, DAggerPhase] | None:
         """Consume a pending transition (called from main loop)."""
@@ -257,10 +278,18 @@ class DAggerStrategy(RolloutStrategy):
             ctx.data.dataset_features, ctx.runtime.cfg.fps, target_size_mb=target_mb
         )
 
-        if self.config.input_device == "keyboard":
-            self._listener = _init_dagger_keyboard(self._events, self.config.keyboard)
-        else:
+        if self.config.input_device == "pedal":
             self._pedal_thread = _init_dagger_pedal(self._events, self.config.pedal)
+        else:
+            # "teleop" keeps the keyboard for stop, resume and upload.
+            self._listener = _init_dagger_keyboard(self._events, self.config.keyboard)
+        if self.config.input_device == "teleop" and not callable(
+            getattr(ctx.hardware.teleop, "get_teleop_events", None)
+        ):
+            raise ValueError(
+                f"DAgger input_device='teleop' needs a teleoperator with get_teleop_events(); "
+                f"{type(ctx.hardware.teleop).__name__} has none"
+            )
 
         record_mode = "all frames (sentry-like)" if self.config.record_autonomous else "corrections only"
         logger.info(
@@ -313,6 +342,18 @@ class DAggerStrategy(RolloutStrategy):
         )
         logger.info("DAgger strategy teardown complete")
 
+    def _transitions(self, ctx: RolloutContext) -> list[tuple[DAggerPhase, DAggerPhase]]:
+        """This tick's phase transitions: the input device's request, then the teleop's signal."""
+        transitions = []
+        requested = self._events.consume_transition()
+        if requested is not None:
+            transitions.append(requested)
+        if self.config.input_device == "teleop":
+            teleop_events = ctx.hardware.teleop.get_teleop_events()
+            active = bool(teleop_events.get(TeleopEvents.IS_INTERVENTION, False))
+            transitions += self._events.follow_intervention(active)
+        return transitions
+
     # ------------------------------------------------------------------
     # Continuous recording mode (record_autonomous=True)
     # ------------------------------------------------------------------
@@ -362,9 +403,7 @@ class DAggerStrategy(RolloutStrategy):
                         break
 
                     # Process transitions
-                    transition = events.consume_transition()
-                    if transition is not None:
-                        old_phase, new_phase = transition
+                    for old_phase, new_phase in self._transitions(ctx):
                         self._apply_transition(
                             old_phase,
                             new_phase,
@@ -523,9 +562,7 @@ class DAggerStrategy(RolloutStrategy):
                         break
 
                     # Process transitions
-                    transition = events.consume_transition()
-                    if transition is not None:
-                        old_phase, new_phase = transition
+                    for old_phase, new_phase in self._transitions(ctx):
                         self._apply_transition(
                             old_phase,
                             new_phase,
@@ -537,8 +574,14 @@ class DAggerStrategy(RolloutStrategy):
                         if new_phase == DAggerPhase.AUTONOMOUS:
                             last_action = None
 
-                        # Correction ended -> save episode (blocking if not streaming)
-                        if old_phase == DAggerPhase.CORRECTING and new_phase == DAggerPhase.PAUSED:
+                        # Correction ended -> save episode (blocking if not streaming). A
+                        # correction shorter than one tick recorded nothing, and
+                        # save_episode() raises on an empty buffer.
+                        if (
+                            old_phase == DAggerPhase.CORRECTING
+                            and new_phase == DAggerPhase.PAUSED
+                            and dataset.has_pending_frames()
+                        ):
                             with self._episode_lock:
                                 dataset.save_episode()
                             recorded += 1
