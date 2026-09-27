@@ -24,8 +24,9 @@ from copy import copy
 import torch
 
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.policies.utils import make_robot_action, prepare_observation_for_inference
+from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.processor import PolicyProcessorPipeline, RelativeActionsProcessorStep
+from lerobot.utils.constants import ACTION
 
 from .base import InferenceEngine
 
@@ -73,6 +74,12 @@ class SyncInferenceEngine(InferenceEngine):
         self._task = task
         self._device = torch.device(device or "cpu")
         self._robot_type = robot_type
+        # The policy's output, in the dataset's action order, is the robot's action keys only:
+        # a teleop pipeline may add action features of its own (a clutch state, a counter),
+        # which the policy never emits.
+        self._policy_action_names = [
+            name for name in dataset_features[ACTION]["names"] if name in ordered_action_keys
+        ]
         self._relative = any(
             isinstance(step, RelativeActionsProcessorStep) and step.enabled
             for step in getattr(preprocessor, "steps", ())
@@ -167,6 +174,6 @@ class SyncInferenceEngine(InferenceEngine):
         return list(chunk.squeeze(0).float().cpu())
 
     def _reorder(self, action_tensor: torch.Tensor) -> torch.Tensor:
-        """Reorder to the dataset action ordering, so callers treat every backend alike."""
-        action_dict = make_robot_action(action_tensor, self._dataset_features)
+        """Name the policy's output, then order it by ``ordered_action_keys``."""
+        action_dict = dict(zip(self._policy_action_names, action_tensor.tolist(), strict=True))
         return torch.tensor([action_dict[k] for k in self._ordered_action_keys])

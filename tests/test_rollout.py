@@ -354,7 +354,7 @@ def test_create_inference_engine_sync():
         postprocessor=MagicMock(),
         robot_wrapper=MagicMock(robot_type="mock"),
         hw_features={},
-        dataset_features={},
+        dataset_features={"action": {"names": ["k"]}},
         ordered_action_keys=["k"],
         task="test",
         fps=30.0,
@@ -412,7 +412,7 @@ class _AnchorPost:
         pass
 
 
-def _relative_engine(policy):
+def _relative_engine(policy, action_names=("x", "y"), ordered_action_keys=("x", "y")):
     from lerobot.rollout import SyncInferenceEngine
 
     pre = _AnchorPre()
@@ -420,8 +420,8 @@ def _relative_engine(policy):
         policy=policy,
         preprocessor=pre,
         postprocessor=_AnchorPost(pre),
-        dataset_features={"action": {"names": ["x", "y"]}},
-        ordered_action_keys=["x", "y"],
+        dataset_features={"action": {"names": list(action_names)}},
+        ordered_action_keys=list(ordered_action_keys),
         task="test",
         device="cpu",
         robot_type="mock",
@@ -447,6 +447,19 @@ def test_sync_relative_policy_runs_whole_chunks_on_one_anchor():
     engine.reset()
     engine.get_action({"observation.state": np.array([50.0, 0.0], dtype=np.float32)})
     assert policy.calls == 3, "reset drops the rest of the chunk"
+
+
+def test_sync_engine_names_only_the_robot_actions_a_teleop_pipeline_adds_to():
+    """A teleop pipeline's own action features (a clutch state) are not the policy's output."""
+    import numpy as np
+
+    engine = _relative_engine(
+        _ChunkPolicy(),
+        action_names=("x", "y", "teleop.engaged", "teleop.engage_id"),
+        ordered_action_keys=("y", "x"),
+    )
+    action = engine.get_action({"observation.state": np.zeros(2, dtype=np.float32)})
+    assert action.tolist() == pytest.approx([-0.1, 0.1]), "named in dataset order, then reordered"
 
 
 def test_sync_relative_policy_refuses_temporal_ensembling_and_history_queues():
