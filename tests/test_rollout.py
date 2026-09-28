@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import sys
 from types import SimpleNamespace
@@ -555,6 +556,215 @@ def test_dagger_teleop_intervention_takes_over_from_any_phase_and_release_holds(
     assert events.follow_intervention(False) == []
     # Pressed again from the hold.
     assert events.follow_intervention(True) == [(paused, corr)]
+
+
+class _Scripted:
+    """A robot whose position is ``x``, and the keys, teleop and ticks that script an episodic run."""
+
+    def __init__(self, events_at, engaged_at):
+        self.x, self.tick = 0.0, -1
+        self.events_at, self.engaged_at = events_at, engaged_at
+        self.strategy = None
+
+    # robot
+    def get_observation(self):
+        self.tick += 1
+        for key, value in self.events_at.get(self.tick, {}).items():
+            self.strategy._events[key] = value
+        return {"x": self.x}
+
+    def send_action(self, action):
+        self.x = float(action["x"])
+
+    # teleop: drives to x=50 while engaged
+    def get_teleop_events(self):
+        from lerobot.teleoperators.utils import TeleopEvents
+
+        return {TeleopEvents.IS_INTERVENTION: self.tick in self.engaged_at}
+
+    def get_action(self):
+        return {"x": 50.0, "teleop.engaged": float(self.tick in self.engaged_at)}
+
+
+class _Pipeline:
+    def __init__(self):
+        self.resets = 0
+
+    def __call__(self, transition):
+        return dict(transition[0])
+
+    def reset(self):
+        self.resets += 1
+
+
+class _Engine:
+    ready = True
+
+    def get_action(self, obs_frame):
+        return torch.tensor([float(obs_frame["observation.state"][0]) + 1.0])
+
+    def start(self):
+        pass
+
+    def reset(self):
+        pass
+
+    def pause(self):
+        pass
+
+    def resume(self):
+        pass
+
+    def notify_observation(self, obs):
+        pass
+
+
+class _Dataset:
+    def __init__(self, root):
+        self.root, self.frames, self.episodes = root, [], []
+
+    @property
+    def num_episodes(self):
+        return len(self.episodes)
+
+    def add_frame(self, frame):
+        self.frames.append(frame)
+
+    def has_pending_frames(self):
+        return bool(self.frames)
+
+    def save_episode(self):
+        if not self.frames:
+            raise RuntimeError("save_episode() on an empty buffer")
+        self.episodes.append(self.frames)
+        self.frames = []
+
+    def clear_episode_buffer(self):
+        self.frames = []
+
+
+def test_episodic_intervention_records_policy_and_takeover_with_outcomes(tmp_path, monkeypatch):
+    import json
+
+    from lerobot.rollout import EpisodicStrategyConfig
+    from lerobot.rollout.strategies import EpisodicStrategy, episodic
+
+    monkeypatch.setattr(episodic, "create_key_listener", lambda *a, **k: None)
+    monkeypatch.setattr(episodic, "VideoEncodingManager", lambda dataset: contextlib.nullcontext())
+    (tmp_path / "meta").mkdir()
+
+    # Episode 0: the policy (t0-2), a takeover (t3-4), held after release (t5), Space (t6)
+    # hands back, `s` (t7) ends it; the reset (t8) ends on the next-episode key. Episode 1:
+    # `f` on its first tick. The last episode has no reset.
+    robot = _Scripted(
+        events_at={
+            6: {"toggle_policy": True},
+            7: {"outcome": "success"},
+            8: {"exit_early": True},
+            9: {"outcome": "failure"},
+        },
+        engaged_at={3, 4},
+    )
+    starts = []
+
+    def episode_start(r):
+        r.x = 100.0
+        starts.append(r.tick)
+        return {"at": 100.0}
+
+    features = {
+        "action": {"dtype": "float32", "shape": (2,), "names": ["x", "teleop.engaged"]},
+        "observation.state": {"dtype": "float32", "shape": (1,), "names": ["x"]},
+    }
+    teleop_pipe = _Pipeline()
+    cfg = SimpleNamespace(
+        dataset=SimpleNamespace(episode_time_s=30, reset_time_s=30, num_episodes=2, single_task="t"),
+        fps=200,
+        task=None,
+        play_sounds=False,
+        display_data=False,
+        display_ip=None,
+        display_port=None,
+        display_compressed_images=False,
+        display_mode=None,
+        use_torch_compile=False,
+        interpolation_multiplier=1,
+    )
+    dataset = _Dataset(tmp_path)
+    ctx = SimpleNamespace(
+        runtime=SimpleNamespace(cfg=cfg, shutdown_event=SimpleNamespace(is_set=lambda: False)),
+        hardware=SimpleNamespace(robot_wrapper=robot, teleop=robot, episode_start=episode_start),
+        policy=SimpleNamespace(inference=_Engine()),
+        processors=SimpleNamespace(
+            teleop_action_processor=teleop_pipe,
+            robot_action_processor=lambda t: dict(t[0]),
+            robot_observation_processor=lambda o: o,
+        ),
+        data=SimpleNamespace(dataset=dataset, dataset_features=features, ordered_action_keys=["x"]),
+    )
+    strategy = EpisodicStrategy(EpisodicStrategyConfig(intervention=True, smooth_handover=False))
+    robot.strategy = strategy
+    strategy.setup(ctx)
+    strategy.run(ctx)
+
+    first, second = dataset.episodes
+    assert [f["action"].tolist() for f in first] == [
+        [101, 0],
+        [102, 0],
+        [103, 0],  # the policy
+        [50, 1],
+        [50, 1],  # the takeover, as the teleop pipeline made it
+        [51, 0],
+        [52, 0],  # after Space: predicted from where the teleop left the arm
+    ]
+    assert [bool(f["intervention"][0]) for f in first] == [False] * 3 + [True] * 2 + [False] * 2
+    assert [f["action"].tolist() for f in second] == [[101, 0]]
+    assert starts == [-1, 8], "a start before each episode, after the reset"
+    # Episode start, the takeover, the reset, the second start: each after something else
+    # moved the robot.
+    assert teleop_pipe.resets == 4
+    rows = json.loads((tmp_path / "meta" / episodic.OUTCOMES).read_text())
+    assert rows == [
+        {
+            "episode_index": 0,
+            "outcome": "success",
+            "frames": 7,
+            "intervention_frames": 2,
+            "interventions": 1,
+            "start": {"at": 100.0},
+        },
+        {
+            "episode_index": 1,
+            "outcome": "failure",
+            "frames": 1,
+            "intervention_frames": 0,
+            "interventions": 0,
+            "start": {"at": 100.0},
+        },
+    ]
+
+
+def test_dagger_takeover_restarts_the_teleop_pipeline_where_the_robot_is():
+    from lerobot.rollout import DAggerStrategyConfig
+    from lerobot.rollout.strategies import DAggerPhase, DAggerStrategy
+
+    pipe = _Pipeline()
+    ctx = SimpleNamespace(
+        hardware=SimpleNamespace(teleop=SimpleNamespace(feedback_features={}), robot_wrapper=None),
+        processors=SimpleNamespace(teleop_action_processor=pipe),
+    )
+    strategy = DAggerStrategy(DAggerStrategyConfig(input_device="teleop", smooth_handover=False))
+    strategy._apply_transition(DAggerPhase.PAUSED, DAggerPhase.CORRECTING, None, None, ctx, None)
+    assert pipe.resets == 1
+
+
+def test_episodic_intervention_requires_a_teleop():
+    from lerobot.rollout import EpisodicStrategyConfig, RolloutConfig
+
+    with pytest.raises(ValueError, match="intervention=true requires --teleop"):
+        RolloutConfig.__post_init__(
+            SimpleNamespace(strategy=EpisodicStrategyConfig(intervention=True), teleop=None)
+        )
 
 
 def test_dagger_config_accepts_teleop_input():

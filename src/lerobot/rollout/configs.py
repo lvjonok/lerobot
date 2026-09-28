@@ -133,10 +133,19 @@ class EpisodicStrategyConfig(RolloutStrategyConfig):
         Right arrow  — end current episode or reset phase early
         Left arrow   — discard current episode and re-record
         Escape       — stop recording session
+        s / f        — mark the episode a success / failure (and end it, when it is running);
+                       saved with the episode in ``meta/episode_outcomes.json``
+        Space        — with ``intervention``: hold the arm / hand it back to the policy
 
     In between episodes:
     - if there is no teleop leader, the robot is held at its initial joint positions captured at startup.
     - else, the robot is moved smoothly to the position of the teleop leader.
+
+    With ``intervention=True`` the teleoperator can also take the arm mid-episode, as DAgger's
+    ``input_device="teleop"`` does: while its ``TeleopEvents.IS_INTERVENTION`` is set it drives,
+    and its frames are recorded in the same episode with ``intervention=True`` (the policy's
+    with ``False``). On release the arm holds until Space hands it back to the policy, which
+    predicts afresh from where the arm is.
     """
 
     # This only applies if there are no teleop leaders specified.
@@ -157,6 +166,10 @@ class EpisodicStrategyConfig(RolloutStrategyConfig):
     # pose on engage: the handover is already continuous there, and the blocking
     # interpolation only delays the start of the reset phase.
     smooth_handover: bool = True
+
+    # Let the teleoperator's intervention signal take the arm mid-episode (see the docstring).
+    # Needs a teleop with ``get_teleop_events``.
+    intervention: bool = False
 
 
 @RolloutStrategyConfig.register_subclass("dagger")
@@ -284,6 +297,12 @@ class RolloutConfig:
         # --- Strategy-specific validation ---
         if isinstance(self.strategy, DAggerStrategyConfig) and self.teleop is None:
             raise ValueError("DAgger strategy requires --teleop.type to be set")
+        if (
+            isinstance(self.strategy, EpisodicStrategyConfig)
+            and self.strategy.intervention
+            and self.teleop is None
+        ):
+            raise ValueError("Episodic strategy with intervention=true requires --teleop.type to be set")
 
         # TODO(Steven): DAgger shouldn't require a dataset (user may want to just rollout+intervene without recording), but for now we require it to simplify the implementation.
         needs_dataset = isinstance(

@@ -23,6 +23,17 @@
       Right arrow  — end the current episode or reset phase early
       Left arrow   — discard the current episode and re-record it
       Escape       — stop the recording session
+      s / f        — mark the episode a success / failure: ends it while it runs, and can be
+                     pressed during the reset that follows too (the last press wins)
+      Space        — with ``intervention``: hold the arm, or hand it back to the policy
+
+- With ``intervention=true``, a teleoperator's ``TeleopEvents.IS_INTERVENTION`` takes the
+  arm mid-episode (a clutch, say): its frames go into the same episode with
+  ``intervention=True``. On release the arm holds until Space. An evaluation that records
+  the policy's own driving and every rescue of it, in one dataset.
+- ``HardwareContext.episode_start``, when given, puts the robot where each episode begins.
+- Each saved episode gets a row in ``meta/episode_outcomes.json``: its outcome, how many
+  times and frames the teleop took over, and what ``episode_start`` did.
 
 Dataset naming follows the rollout convention: repo names must start with ``rollout_``.
 """
@@ -30,8 +41,13 @@ Dataset naming follows the rollout convention: repo names must start with ``roll
 from __future__ import annotations
 
 import contextlib
+import enum
+import json
 import logging
 import time
+from pathlib import Path
+
+import numpy as np
 
 from lerobot.common.control_utils import (
     follower_smooth_move_to,
@@ -39,9 +55,10 @@ from lerobot.common.control_utils import (
     teleop_supports_feedback,
 )
 from lerobot.datasets import VideoEncodingManager
+from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame
-from lerobot.utils.keyboard_input import init_keyboard_listener
+from lerobot.utils.keyboard_input import apply_recording_control, create_key_listener
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import log_say
 from lerobot.utils.visualization_utils import log_visualization_data
@@ -51,6 +68,38 @@ from ..context import RolloutContext
 from .core import RolloutStrategy, safe_push_to_hub, send_next_action
 
 logger = logging.getLogger(__name__)
+
+OUTCOMES = "episode_outcomes.json"
+"""Per saved episode, in ``meta/``: outcome, interventions, and the start it was given."""
+
+
+class _Phase(enum.Enum):
+    POLICY = "policy"
+    CORRECTING = "correcting"  # the teleop drives, recorded with intervention=True
+    HELD = "held"  # nobody drives; the last command is repeated, nothing recorded
+
+
+def _init_keyboard(events: dict):
+    """Right/Left/Esc (n/r/q) as ``lerobot-record`` has them, plus s/f and Space."""
+
+    def on_key(name: str) -> None:
+        key = name.lower()
+        if key in ("right", "n"):
+            apply_recording_control("right", events)
+        elif key in ("left", "r"):
+            apply_recording_control("left", events)
+        elif key in ("esc", "q"):
+            apply_recording_control("esc", events)
+        elif key in ("s", "f"):
+            events["outcome"] = "success" if key == "s" else "failure"
+            logger.info("Outcome: %s", events["outcome"])
+        elif key == "space":
+            events["toggle_policy"] = True
+
+    return create_key_listener(
+        on_key,
+        controls_help="Right/Left/Esc (n/r/q), s=success, f=failure, Space=hold/resume policy",
+    )
 
 
 class EpisodicStrategy(RolloutStrategy):
@@ -77,11 +126,30 @@ class EpisodicStrategy(RolloutStrategy):
         super().__init__(config)
         self._listener = None
         self._events: dict | None = None
+        self._outcomes: list[dict] = []
+        self._outcomes_path: Path | None = None
+        self._session_start = 0
 
     def setup(self, ctx: RolloutContext) -> None:
         """Start the inference engine and attach the keyboard listener."""
+        if self.config.intervention and not hasattr(ctx.hardware.teleop, "get_teleop_events"):
+            raise ValueError(
+                "Episodic intervention needs a teleop with get_teleop_events(); "
+                f"{type(ctx.hardware.teleop).__name__} has none"
+            )
         self._init_engine(ctx)
-        self._listener, self._events = init_keyboard_listener()
+        self._events = {
+            "exit_early": False,
+            "rerecord_episode": False,
+            "stop_recording": False,
+            "outcome": None,
+            "toggle_policy": False,
+        }
+        self._listener = _init_keyboard(self._events)
+        self._outcomes_path = Path(ctx.data.dataset.root) / "meta" / OUTCOMES
+        if self._outcomes_path.exists():
+            self._outcomes = json.loads(self._outcomes_path.read_text())
+        self._session_start = len(self._outcomes)
         logger.info("Episodic strategy ready")
 
     def run(self, ctx: RolloutContext) -> None:
@@ -114,13 +182,21 @@ class EpisodicStrategy(RolloutStrategy):
                     if ctx.runtime.shutdown_event.is_set():
                         break
 
+                    start = None
+                    if ctx.hardware.episode_start is not None:
+                        start = ctx.hardware.episode_start(robot)
+                        # The robot moved under something other than the teleop.
+                        ctx.processors.teleop_action_processor.reset()
+                    events["outcome"] = None
+                    events["toggle_policy"] = False
+
                     # Reset policy state at episode start (discard leftover hidden state / queue)
                     self._engine.reset()
                     self._interpolator.reset()
                     self._engine.resume()
 
                     log_say(f"Recording episode {dataset.num_episodes}", play_sounds)
-                    self._policy_loop(
+                    counts = self._policy_loop(
                         ctx=ctx,
                         robot=robot,
                         events=events,
@@ -183,6 +259,7 @@ class EpisodicStrategy(RolloutStrategy):
                         log_say("Re-record episode", play_sounds)
                         events["rerecord_episode"] = False
                         events["exit_early"] = False
+                        events["outcome"] = None
                         dataset.clear_episode_buffer()
 
                         # returns to its initial joint positions captured at startup
@@ -191,8 +268,16 @@ class EpisodicStrategy(RolloutStrategy):
 
                         continue
 
+                    # Ended before a frame was recorded (a key at the start, or held
+                    # throughout): save_episode() raises on an empty buffer.
+                    if not dataset.has_pending_frames():
+                        continue
+                    index = dataset.num_episodes
                     dataset.save_episode()
                     recorded_episodes += 1
+                    self._file_outcome(
+                        {"episode_index": index, "outcome": events["outcome"], **counts, "start": start}
+                    )
             finally:
                 # Save any frames buffered in the current episode so an unexpected
                 # exception or KeyboardInterrupt does not silently drop recorded data.
@@ -211,10 +296,33 @@ class EpisodicStrategy(RolloutStrategy):
         control_time_s: float,
         dataset,
         single_task: str,
-    ) -> None:
-        """Policy-driven recording loop for a single episode."""
+    ) -> dict[str, int]:
+        """Policy-driven recording loop for a single episode; with ``intervention``, the teleop's too.
+
+        Returns:
+            ``frames``, ``intervention_frames`` and ``interventions`` (takeovers) recorded.
+        """
         interpolator = self._interpolator
         control_interval = interpolator.get_control_interval(fps)
+        processors = ctx.processors
+        teleop = ctx.hardware.teleop
+        intervene = self.config.intervention
+
+        phase = _Phase.POLICY
+        last_sent: dict | None = None
+        counts = {"frames": 0, "intervention_frames": 0, "interventions": 0}
+
+        def add(obs_processed: dict, action: dict, intervention: bool) -> None:
+            frame = {
+                **build_dataset_frame(features, obs_processed, prefix=OBS_STR),
+                **build_dataset_frame(features, action, prefix=ACTION),
+                "task": single_task,
+            }
+            if intervene:
+                frame["intervention"] = np.array([intervention], dtype=bool)
+            dataset.add_frame(frame)
+            counts["frames"] += 1
+            counts["intervention_frames"] += intervention
 
         timestamp = 0.0
         start_t = time.perf_counter()
@@ -225,23 +333,67 @@ class EpisodicStrategy(RolloutStrategy):
             if events["exit_early"]:
                 events["exit_early"] = False
                 break
+            if events["outcome"] is not None:
+                break
 
             if ctx.runtime.shutdown_event.is_set():
                 break
 
             obs = robot.get_observation()
-            obs_processed = self._process_observation_and_notify(ctx.processors, obs)
 
-            if self._handle_warmup(ctx.runtime.cfg.use_torch_compile, loop_start, control_interval):
-                continue
+            teleop_action = None
+            if intervene:
+                active = bool(teleop.get_teleop_events().get(TeleopEvents.IS_INTERVENTION, False))
+                if active and phase != _Phase.CORRECTING:
+                    # Whatever the teleop pipeline last targeted, the policy has moved the arm
+                    # since: start it over from where the arm is.
+                    processors.teleop_action_processor.reset()
+                    self._engine.pause()
+                    phase = _Phase.CORRECTING
+                    counts["interventions"] += 1
+                    logger.info("Intervention %d: the teleop has the arm", counts["interventions"])
+                elif not active and phase == _Phase.CORRECTING:
+                    phase = _Phase.HELD
+                    logger.info("Intervention released: holding; Space hands the arm to the policy")
+                if events["toggle_policy"]:
+                    events["toggle_policy"] = False
+                    if phase == _Phase.HELD:
+                        # Predict afresh from where the arm is, not from before the takeover.
+                        self._engine.reset()
+                        interpolator.reset()
+                        self._engine.resume()
+                        phase = _Phase.POLICY
+                        logger.info("Policy resumed")
+                    elif phase == _Phase.POLICY:
+                        self._engine.pause()
+                        phase = _Phase.HELD
+                        logger.info("Policy held; Space resumes it")
+                # Every tick, so the channels the teleop adds to the action have a value on the
+                # policy's frames too (a clutch that is not engaged, say).
+                teleop_action = processors.teleop_action_processor((teleop.get_action(), obs))
 
-            action_dict = send_next_action(obs_processed, obs, ctx, interpolator)
+            if phase == _Phase.CORRECTING:
+                obs_processed = processors.robot_observation_processor(obs)
+                last_sent = processors.robot_action_processor((teleop_action, obs))
+                robot.send_action(last_sent)
+                add(obs_processed, teleop_action, True)
+                self._log_telemetry(obs_processed, teleop_action, ctx.runtime)
+            elif phase == _Phase.HELD:
+                if last_sent is not None:
+                    robot.send_action(last_sent)
+            else:
+                obs_processed = self._process_observation_and_notify(processors, obs)
 
-            if action_dict is not None:
-                obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
-                action_frame = build_dataset_frame(features, action_dict, prefix=ACTION)
-                dataset.add_frame({**obs_frame, **action_frame, "task": single_task})
-                self._log_telemetry(obs_processed, action_dict, ctx.runtime)
+                if self._handle_warmup(ctx.runtime.cfg.use_torch_compile, loop_start, control_interval):
+                    continue
+
+                action_dict = send_next_action(obs_processed, obs, ctx, interpolator)
+
+                if action_dict is not None:
+                    last_sent = processors.robot_action_processor((action_dict, obs))
+                    recorded = action_dict if teleop_action is None else {**teleop_action, **action_dict}
+                    add(obs_processed, recorded, False)
+                    self._log_telemetry(obs_processed, action_dict, ctx.runtime)
 
             dt = time.perf_counter() - loop_start
             sleep_t = control_interval - dt
@@ -254,6 +406,9 @@ class EpisodicStrategy(RolloutStrategy):
                 )
             precise_sleep(max(sleep_t, 0.0))
             timestamp = time.perf_counter() - start_t
+
+        self._engine.pause()
+        return counts
 
     def _reset_loop(
         self,
@@ -270,6 +425,8 @@ class EpisodicStrategy(RolloutStrategy):
         """Reset-phase loop: teleop drives the robot if available, no recording."""
         processors = ctx.processors
         control_interval = 1.0 / fps
+        # The policy moved the robot since the teleop pipeline last ran.
+        processors.teleop_action_processor.reset()
 
         timestamp = 0.0
         start_t = time.perf_counter()
@@ -306,12 +463,36 @@ class EpisodicStrategy(RolloutStrategy):
             precise_sleep(max(sleep_t, 0.0))
             timestamp = time.perf_counter() - start_t
 
+    def _file_outcome(self, row: dict) -> None:
+        """Append one saved episode's row to ``meta/episode_outcomes.json``."""
+        self._outcomes.append(row)
+        self._outcomes_path.write_text(json.dumps(self._outcomes, indent=2))
+        logger.info(
+            "Episode %d saved: %s, %d frames, %d intervention(s)",
+            row["episode_index"],
+            row["outcome"] or "no outcome marked",
+            row["frames"],
+            row["interventions"],
+        )
+
     def teardown(self, ctx: RolloutContext) -> None:
         """Finalise dataset, stop listener, push to hub, and disconnect hardware."""
         cfg = ctx.runtime.cfg
         play_sounds = cfg.play_sounds
 
         log_say("Stop recording", play_sounds, blocking=True)
+
+        session = self._outcomes[self._session_start :]
+        if session:
+            marked = [r for r in session if r["outcome"] is not None]
+            wins = sum(r["outcome"] == "success" for r in marked)
+            logger.info(
+                "This session: %d episode(s), %d/%d marked a success, %d with an intervention",
+                len(session),
+                wins,
+                len(marked),
+                sum(r["interventions"] > 0 for r in session),
+            )
 
         if self._listener is not None:
             self._listener.stop()

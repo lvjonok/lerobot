@@ -22,10 +22,11 @@ and :class:`DatasetContext` — assembled into :class:`RolloutContext`.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from copy import copy
 from dataclasses import dataclass, field
 from threading import Event
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -50,7 +51,7 @@ from lerobot.teleoperators import Teleoperator, make_teleoperator_from_config
 from lerobot.utils.feature_utils import combine_feature_dicts, hw_to_dataset_features
 from lerobot.utils.import_utils import _peft_available, require_package
 
-from .configs import BaseStrategyConfig, DAggerStrategyConfig, RolloutConfig
+from .configs import BaseStrategyConfig, DAggerStrategyConfig, EpisodicStrategyConfig, RolloutConfig
 from .inference import (
     InferenceEngine,
     RTCInferenceConfig,
@@ -146,6 +147,9 @@ class HardwareContext:
     robot_wrapper: ThreadSafeRobot
     teleop: Teleoperator | None
     initial_position: dict | None = None
+    # Puts the robot where an episode starts (episodic strategy), and returns what it did, to be
+    # filed with the episode. ``None``: an episode starts wherever the robot is.
+    episode_start: Callable[[ThreadSafeRobot], dict[str, Any]] | None = None
 
 
 @dataclass
@@ -231,6 +235,7 @@ def build_rollout_context(
     teleop_action_processor: RobotProcessorPipeline | None = None,
     robot_action_processor: RobotProcessorPipeline | None = None,
     robot_observation_processor: RobotProcessorPipeline | None = None,
+    episode_start: Callable[[ThreadSafeRobot], dict[str, Any]] | None = None,
 ) -> RolloutContext:
     """Wire up policy, processors, hardware, dataset, and inference engine.
 
@@ -416,7 +421,9 @@ def build_rollout_context(
                 * len(robot.cameras if hasattr(robot, "cameras") else []),
             )
         else:
-            if isinstance(cfg.strategy, DAggerStrategyConfig):
+            if isinstance(cfg.strategy, DAggerStrategyConfig) or (
+                isinstance(cfg.strategy, EpisodicStrategyConfig) and cfg.strategy.intervention
+            ):
                 dataset_features["intervention"] = {
                     "dtype": "bool",
                     "shape": (1,),
@@ -500,7 +507,10 @@ def build_rollout_context(
     return RolloutContext(
         runtime=RuntimeContext(cfg=cfg, shutdown_event=shutdown_event),
         hardware=HardwareContext(
-            robot_wrapper=robot_wrapper, teleop=teleop, initial_position=initial_position
+            robot_wrapper=robot_wrapper,
+            teleop=teleop,
+            initial_position=initial_position,
+            episode_start=episode_start,
         ),
         policy=PolicyContext(
             policy=policy,

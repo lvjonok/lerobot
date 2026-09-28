@@ -151,6 +151,8 @@ Usage examples
 """
 
 import logging
+from collections.abc import Callable
+from typing import Any
 
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
@@ -175,6 +177,7 @@ from lerobot.robots import (  # noqa: F401
     unitree_g1 as unitree_g1_robot,
 )
 from lerobot.rollout import RolloutConfig, build_rollout_context, create_strategy
+from lerobot.rollout.robot_wrapper import ThreadSafeRobot
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
@@ -206,12 +209,14 @@ def rollout(
     teleop_action_processor: RobotProcessorPipeline | None = None,
     robot_action_processor: RobotProcessorPipeline | None = None,
     robot_observation_processor: RobotProcessorPipeline | None = None,
+    episode_start: Callable[[ThreadSafeRobot], dict[str, Any]] | None = None,
 ):
     """Main entry point for policy deployment.
 
     The processors are for callers that need their own, as ``record()`` takes them: a teleop
     whose raw action is not a robot action (a clutch delta, say) passes the pipeline that
-    makes it one.  ``None`` keeps LeRobot's defaults.
+    makes it one.  ``None`` keeps LeRobot's defaults. ``episode_start`` puts the robot where
+    each episode of the episodic strategy begins (``HardwareContext.episode_start``).
     """
     init_logging()
 
@@ -234,6 +239,7 @@ def rollout(
         teleop_action_processor=teleop_action_processor,
         robot_action_processor=robot_action_processor,
         robot_observation_processor=robot_observation_processor,
+        episode_start=episode_start,
     )
 
     strategy = create_strategy(cfg.strategy)
