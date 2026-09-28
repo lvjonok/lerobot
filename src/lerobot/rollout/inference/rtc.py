@@ -130,7 +130,7 @@ class RTCInferenceEngine(InferenceEngine):
         self._robot = robot_wrapper
         self._rtc_config = rtc_config
         self._hw_features = hw_features
-        self._task = task
+        self.task = task
         self._fps = fps
         self._device = device or "cpu"
         self._use_torch_compile = use_torch_compile
@@ -296,9 +296,9 @@ class RTCInferenceEngine(InferenceEngine):
 
                         obs_batch = build_dataset_frame(self._hw_features, obs, prefix="observation")
                         obs_batch = prepare_observation_for_inference(
-                            obs_batch, policy_device, self._task, self._robot.robot_type
+                            obs_batch, policy_device, self.task, self._robot.robot_type
                         )
-                        obs_batch["task"] = [self._task]
+                        obs_batch["task"] = [self.task]
 
                         preprocessed = self._preprocessor(obs_batch)
 

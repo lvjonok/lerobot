@@ -26,14 +26,20 @@
       s / f        — mark the episode a success / failure: ends it while it runs, and can be
                      pressed during the reset that follows too (the last press wins)
       Space        — with ``intervention``: hold the arm, or hand it back to the policy
+      t            — the next attempt's task: the next of the policy's training tasks
 
 - With ``intervention=true``, a teleoperator's ``TeleopEvents.IS_INTERVENTION`` takes the
   arm mid-episode (a clutch, say): its frames go into the same episode with
   ``intervention=True``. On release the arm holds until Space. An evaluation that records
   the policy's own driving and every rescue of it, in one dataset.
 - ``HardwareContext.episode_start``, when given, puts the robot where each episode begins.
-- Each saved episode gets a row in ``meta/episode_outcomes.json``: its outcome, how many
-  times and frames the teleop took over, and what ``episode_start`` did.
+- Each saved episode gets a row in ``meta/episode_outcomes.json``: its outcome, its task,
+  how many times and frames the teleop took over, and what ``episode_start`` did.
+- A policy trained on several tasks (``config.tasks``) is asked one per attempt, chosen
+  between attempts; frames are recorded under the task the attempt was asked.
+- ``control_port``: the same commands, and the state, over :mod:`lerobot.rollout.control`
+  for ``lerobot-rollout-tui`` instead of the keyboard, and a "ready" phase before the first
+  attempt, so the session starts when the operator says.
 
 Dataset naming follows the rollout convention: repo names must start with ``rollout_``.
 """
@@ -65,6 +71,7 @@ from lerobot.utils.visualization_utils import log_visualization_data
 
 from ..configs import EpisodicStrategyConfig
 from ..context import RolloutContext
+from ..control import ControlServer
 from .core import RolloutStrategy, safe_push_to_hub, send_next_action
 
 logger = logging.getLogger(__name__)
@@ -79,27 +86,19 @@ class _Phase(enum.Enum):
     HELD = "held"  # nobody drives; the last command is repeated, nothing recorded
 
 
-def _init_keyboard(events: dict):
-    """Right/Left/Esc (n/r/q) as ``lerobot-record`` has them, plus s/f and Space."""
-
-    def on_key(name: str) -> None:
-        key = name.lower()
-        if key in ("right", "n"):
-            apply_recording_control("right", events)
-        elif key in ("left", "r"):
-            apply_recording_control("left", events)
-        elif key in ("esc", "q"):
-            apply_recording_control("esc", events)
-        elif key in ("s", "f"):
-            events["outcome"] = "success" if key == "s" else "failure"
-            logger.info("Outcome: %s", events["outcome"])
-        elif key == "space":
-            events["toggle_policy"] = True
-
-    return create_key_listener(
-        on_key,
-        controls_help="Right/Left/Esc (n/r/q), s=success, f=failure, Space=hold/resume policy",
-    )
+_KEYS = {
+    "right": "next",
+    "n": "next",
+    "left": "discard",
+    "r": "discard",
+    "esc": "quit",
+    "q": "quit",
+    "s": "success",
+    "f": "failure",
+    "space": "hold",
+    "t": "task",
+}
+"""Keyboard to command: Right/Left/Esc (n/r/q) as ``lerobot-record`` has them, and the rest."""
 
 
 class EpisodicStrategy(RolloutStrategy):
@@ -129,6 +128,15 @@ class EpisodicStrategy(RolloutStrategy):
         self._outcomes: list[dict] = []
         self._outcomes_path: Path | None = None
         self._session_start = 0
+        self._control: ControlServer | None = None
+        self._tasks: list[str] = []
+        self._task: str | None = None
+        self._next_task: str | None = None
+        self._phase = "starting"
+        self._attempt_t0: float | None = None
+        self._counts = {"frames": 0, "intervention_frames": 0, "interventions": 0}
+        self._episode_time_s = 0.0
+        self._index = 0
 
     def setup(self, ctx: RolloutContext) -> None:
         """Start the inference engine and attach the keyboard listener."""
@@ -137,6 +145,14 @@ class EpisodicStrategy(RolloutStrategy):
                 "Episodic intervention needs a teleop with get_teleop_events(); "
                 f"{type(ctx.hardware.teleop).__name__} has none"
             )
+        cfg = ctx.runtime.cfg
+        asked = cfg.dataset.single_task or cfg.task
+        # A policy trained on several tasks lists them; any other is asked what it was given.
+        self._tasks = list(getattr(ctx.policy.policy.config, "tasks", None) or [asked])
+        if asked not in self._tasks:
+            raise ValueError(f"the policy was trained on {self._tasks}; the task given is {asked!r}")
+        self._task = self._next_task = asked
+        self._episode_time_s = cfg.dataset.episode_time_s
         self._init_engine(ctx)
         self._events = {
             "exit_early": False,
@@ -145,12 +161,74 @@ class EpisodicStrategy(RolloutStrategy):
             "outcome": None,
             "toggle_policy": False,
         }
-        self._listener = _init_keyboard(self._events)
+        if self.config.control_port is not None:
+            self._control = ControlServer(self.config.control_port, self._command, self._state)
+            self._control.start()
+        else:
+            self._listener = create_key_listener(
+                lambda name: self._key(name.lower()),
+                controls_help="Right/Left/Esc (n/r/q), s=success, f=failure, Space=hold/resume, t=next task",
+            )
         self._outcomes_path = Path(ctx.data.dataset.root) / "meta" / OUTCOMES
         if self._outcomes_path.exists():
             self._outcomes = json.loads(self._outcomes_path.read_text())
         self._session_start = len(self._outcomes)
-        logger.info("Episodic strategy ready")
+        self._index = ctx.data.dataset.num_episodes
+        logger.info("Episodic strategy ready; tasks %s", self._tasks)
+
+    def _key(self, name: str) -> None:
+        if name in _KEYS:
+            self._command(_KEYS[name], None)
+
+    def _command(self, cmd: str, arg) -> None:
+        """Apply one operator command (a key, or the control channel's).
+
+        Raises:
+            ValueError: A task the policy was not trained on.
+        """
+        events = self._events
+        if cmd in ("next", "discard", "quit"):
+            apply_recording_control({"next": "right", "discard": "left", "quit": "esc"}[cmd], events)
+        elif cmd in ("success", "failure"):
+            events["outcome"] = cmd
+            logger.info("Outcome: %s", cmd)
+        elif cmd == "hold":
+            events["toggle_policy"] = True
+        elif cmd == "task":
+            if arg is None:
+                arg = self._tasks[(self._tasks.index(self._next_task) + 1) % len(self._tasks)]
+            if arg not in self._tasks:
+                raise ValueError(f"{arg!r} is not one of the policy's tasks {self._tasks}")
+            self._next_task = arg
+            logger.info("Next attempt's task: %s", arg)
+
+    def _state(self) -> dict:
+        """What the control channel reports."""
+        session = self._outcomes[self._session_start :]
+        return {
+            "phase": self._phase,
+            "episode": self._index,
+            "elapsed_s": None if self._attempt_t0 is None else time.perf_counter() - self._attempt_t0,
+            "episode_time_s": self._episode_time_s,
+            "task": self._task,
+            "next_task": self._next_task,
+            "tasks": self._tasks,
+            "outcome": self._events["outcome"] if self._events else None,
+            "counts": dict(self._counts),
+            "session": {
+                "episodes": len(session),
+                "success": sum(r["outcome"] == "success" for r in session),
+                "failure": sum(r["outcome"] == "failure" for r in session),
+                "by_task": {
+                    t: [
+                        sum(r["outcome"] == o for r in session if r.get("task") == t)
+                        for o in ("success", "failure", None)
+                    ]
+                    for t in self._tasks
+                },
+            },
+            "intervention": self.config.intervention,
+        }
 
     def run(self, ctx: RolloutContext) -> None:
         """Main multi-episode recording loop."""
@@ -166,7 +244,6 @@ class EpisodicStrategy(RolloutStrategy):
         episode_time_s = dataset_cfg.episode_time_s
         reset_time_s = dataset_cfg.reset_time_s
         num_episodes = dataset_cfg.num_episodes
-        single_task = dataset_cfg.single_task or cfg.task
         play_sounds = cfg.play_sounds
 
         display_compressed = (
@@ -177,13 +254,32 @@ class EpisodicStrategy(RolloutStrategy):
 
         with VideoEncodingManager(dataset):
             try:
+                if self._control is not None:
+                    # The session starts when the operator says: the reset loop, nothing recorded.
+                    self._phase = "ready"
+                    self._reset_loop(
+                        ctx=ctx,
+                        robot=robot,
+                        teleop=teleop,
+                        events=events,
+                        fps=fps,
+                        control_time_s=float("inf"),
+                        display_data=cfg.display_data,
+                        display_mode=cfg.display_mode,
+                        display_compressed=display_compressed,
+                    )
                 recorded_episodes = 0
                 while recorded_episodes < num_episodes and not events["stop_recording"]:
                     if ctx.runtime.shutdown_event.is_set():
                         break
 
+                    self._task = self._next_task
+                    self._engine.task = self._task
+                    self._index = dataset.num_episodes
+                    self._counts = {"frames": 0, "intervention_frames": 0, "interventions": 0}
                     start = None
                     if ctx.hardware.episode_start is not None:
+                        self._phase = "walking"
                         start = ctx.hardware.episode_start(robot)
                         # The robot moved under something other than the teleop.
                         ctx.processors.teleop_action_processor.reset()
@@ -196,7 +292,9 @@ class EpisodicStrategy(RolloutStrategy):
                     self._engine.resume()
 
                     log_say(f"Recording episode {dataset.num_episodes}", play_sounds)
-                    counts = self._policy_loop(
+                    logger.info("Attempt %d: %s", dataset.num_episodes, self._task)
+                    self._attempt_t0 = time.perf_counter()
+                    self._policy_loop(
                         ctx=ctx,
                         robot=robot,
                         events=events,
@@ -204,14 +302,16 @@ class EpisodicStrategy(RolloutStrategy):
                         fps=fps,
                         control_time_s=episode_time_s,
                         dataset=dataset,
-                        single_task=single_task,
                     )
+                    self._attempt_t0 = None
+                    counts = dict(self._counts)
 
                     # Reset phase, skip after the last episode (but run when re-recording)
                     if not events["stop_recording"] and (
                         recorded_episodes < num_episodes - 1 or events["rerecord_episode"]
                     ):
                         log_say("Reset the environment", play_sounds)
+                        self._phase = "reset"
 
                         if teleop:
                             # Smooth handover so the transition to teleop control is jerk-free.
@@ -272,13 +372,22 @@ class EpisodicStrategy(RolloutStrategy):
                     # throughout): save_episode() raises on an empty buffer.
                     if not dataset.has_pending_frames():
                         continue
+                    self._phase = "saving"
                     index = dataset.num_episodes
                     dataset.save_episode()
                     recorded_episodes += 1
                     self._file_outcome(
-                        {"episode_index": index, "outcome": events["outcome"], **counts, "start": start}
+                        {
+                            "episode_index": index,
+                            "outcome": events["outcome"],
+                            "task": self._task,
+                            **counts,
+                            "start": start,
+                        }
                     )
+                    self._index = dataset.num_episodes
             finally:
+                self._phase = "done"
                 # Save any frames buffered in the current episode so an unexpected
                 # exception or KeyboardInterrupt does not silently drop recorded data.
                 # suppress: save_episode raises if the buffer is empty (nothing to lose).
@@ -295,12 +404,11 @@ class EpisodicStrategy(RolloutStrategy):
         fps: float,
         control_time_s: float,
         dataset,
-        single_task: str,
-    ) -> dict[str, int]:
+    ) -> None:
         """Policy-driven recording loop for a single episode; with ``intervention``, the teleop's too.
 
-        Returns:
-            ``frames``, ``intervention_frames`` and ``interventions`` (takeovers) recorded.
+        Counts ``frames``, ``intervention_frames`` and ``interventions`` (takeovers) into
+        ``self._counts``, and keeps ``self._phase`` current.
         """
         interpolator = self._interpolator
         control_interval = interpolator.get_control_interval(fps)
@@ -309,14 +417,15 @@ class EpisodicStrategy(RolloutStrategy):
         intervene = self.config.intervention
 
         phase = _Phase.POLICY
+        self._phase = phase.value
         last_sent: dict | None = None
-        counts = {"frames": 0, "intervention_frames": 0, "interventions": 0}
+        counts = self._counts
 
         def add(obs_processed: dict, action: dict, intervention: bool) -> None:
             frame = {
                 **build_dataset_frame(features, obs_processed, prefix=OBS_STR),
                 **build_dataset_frame(features, action, prefix=ACTION),
-                "task": single_task,
+                "task": self._task,
             }
             if intervene:
                 frame["intervention"] = np.array([intervention], dtype=bool)
@@ -371,6 +480,7 @@ class EpisodicStrategy(RolloutStrategy):
                 # Every tick, so the channels the teleop adds to the action have a value on the
                 # policy's frames too (a clutch that is not engaged, say).
                 teleop_action = processors.teleop_action_processor((teleop.get_action(), obs))
+            self._phase = phase.value
 
             if phase == _Phase.CORRECTING:
                 obs_processed = processors.robot_observation_processor(obs)
@@ -408,7 +518,6 @@ class EpisodicStrategy(RolloutStrategy):
             timestamp = time.perf_counter() - start_t
 
         self._engine.pause()
-        return counts
 
     def _reset_loop(
         self,
@@ -496,6 +605,8 @@ class EpisodicStrategy(RolloutStrategy):
 
         if self._listener is not None:
             self._listener.stop()
+        if self._control is not None:
+            self._control.stop()
 
         if ctx.data.dataset is not None:
             logger.info("Finalizing dataset...")

@@ -71,7 +71,7 @@ class SyncInferenceEngine(InferenceEngine):
         self._postprocessor = postprocessor
         self._dataset_features = dataset_features
         self._ordered_action_keys = ordered_action_keys
-        self._task = task
+        self.task = task
         self._device = torch.device(device or "cpu")
         self._robot_type = robot_type
         # The policy's output, in the dataset's action order, is the robot's action keys only:
@@ -142,7 +142,7 @@ class SyncInferenceEngine(InferenceEngine):
         )
         with torch.inference_mode(), autocast_ctx:
             observation = prepare_observation_for_inference(
-                observation, self._device, self._task, self._robot_type
+                observation, self._device, self.task, self._robot_type
             )
             observation = self._preprocessor(observation)
             action = self._policy.select_action(observation)
@@ -163,7 +163,7 @@ class SyncInferenceEngine(InferenceEngine):
         )
         with torch.inference_mode(), autocast_ctx:
             observation = prepare_observation_for_inference(
-                observation, self._device, self._task, self._robot_type
+                observation, self._device, self.task, self._robot_type
             )
             # The relative step caches this observation's state; the postprocessor below composes
             # the chunk onto it before any later observation can replace it.

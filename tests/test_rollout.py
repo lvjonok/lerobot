@@ -643,6 +643,47 @@ class _Dataset:
         self.frames = []
 
 
+def _episodic_ctx(tmp_path, robot, episode_start, *, num_episodes, tasks=None, single_task="t"):
+    """A rollout context around a :class:`_Scripted` robot, and its teleop pipeline."""
+    features = {
+        "action": {"dtype": "float32", "shape": (2,), "names": ["x", "teleop.engaged"]},
+        "observation.state": {"dtype": "float32", "shape": (1,), "names": ["x"]},
+    }
+    teleop_pipe = _Pipeline()
+    cfg = SimpleNamespace(
+        dataset=SimpleNamespace(
+            episode_time_s=30, reset_time_s=30, num_episodes=num_episodes, single_task=single_task
+        ),
+        fps=200,
+        task=None,
+        play_sounds=False,
+        display_data=False,
+        display_ip=None,
+        display_port=None,
+        display_compressed_images=False,
+        display_mode=None,
+        use_torch_compile=False,
+        interpolation_multiplier=1,
+    )
+    (tmp_path / "meta").mkdir()
+    ctx = SimpleNamespace(
+        runtime=SimpleNamespace(cfg=cfg, shutdown_event=SimpleNamespace(is_set=lambda: False)),
+        hardware=SimpleNamespace(robot_wrapper=robot, teleop=robot, episode_start=episode_start),
+        policy=SimpleNamespace(
+            inference=_Engine(), policy=SimpleNamespace(config=SimpleNamespace(tasks=tasks))
+        ),
+        processors=SimpleNamespace(
+            teleop_action_processor=teleop_pipe,
+            robot_action_processor=lambda t: dict(t[0]),
+            robot_observation_processor=lambda o: o,
+        ),
+        data=SimpleNamespace(
+            dataset=_Dataset(tmp_path), dataset_features=features, ordered_action_keys=["x"]
+        ),
+    )
+    return ctx, teleop_pipe
+
+
 def test_episodic_intervention_records_policy_and_takeover_with_outcomes(tmp_path, monkeypatch):
     import json
 
@@ -651,7 +692,6 @@ def test_episodic_intervention_records_policy_and_takeover_with_outcomes(tmp_pat
 
     monkeypatch.setattr(episodic, "create_key_listener", lambda *a, **k: None)
     monkeypatch.setattr(episodic, "VideoEncodingManager", lambda dataset: contextlib.nullcontext())
-    (tmp_path / "meta").mkdir()
 
     # Episode 0: the policy (t0-2), a takeover (t3-4), held after release (t5), Space (t6)
     # hands back, `s` (t7) ends it; the reset (t8) ends on the next-episode key. Episode 1:
@@ -672,36 +712,8 @@ def test_episodic_intervention_records_policy_and_takeover_with_outcomes(tmp_pat
         starts.append(r.tick)
         return {"at": 100.0}
 
-    features = {
-        "action": {"dtype": "float32", "shape": (2,), "names": ["x", "teleop.engaged"]},
-        "observation.state": {"dtype": "float32", "shape": (1,), "names": ["x"]},
-    }
-    teleop_pipe = _Pipeline()
-    cfg = SimpleNamespace(
-        dataset=SimpleNamespace(episode_time_s=30, reset_time_s=30, num_episodes=2, single_task="t"),
-        fps=200,
-        task=None,
-        play_sounds=False,
-        display_data=False,
-        display_ip=None,
-        display_port=None,
-        display_compressed_images=False,
-        display_mode=None,
-        use_torch_compile=False,
-        interpolation_multiplier=1,
-    )
-    dataset = _Dataset(tmp_path)
-    ctx = SimpleNamespace(
-        runtime=SimpleNamespace(cfg=cfg, shutdown_event=SimpleNamespace(is_set=lambda: False)),
-        hardware=SimpleNamespace(robot_wrapper=robot, teleop=robot, episode_start=episode_start),
-        policy=SimpleNamespace(inference=_Engine()),
-        processors=SimpleNamespace(
-            teleop_action_processor=teleop_pipe,
-            robot_action_processor=lambda t: dict(t[0]),
-            robot_observation_processor=lambda o: o,
-        ),
-        data=SimpleNamespace(dataset=dataset, dataset_features=features, ordered_action_keys=["x"]),
-    )
+    ctx, teleop_pipe = _episodic_ctx(tmp_path, robot, episode_start, num_episodes=2)
+    dataset = ctx.data.dataset
     strategy = EpisodicStrategy(EpisodicStrategyConfig(intervention=True, smooth_handover=False))
     robot.strategy = strategy
     strategy.setup(ctx)
@@ -724,6 +736,7 @@ def test_episodic_intervention_records_policy_and_takeover_with_outcomes(tmp_pat
     # moved the robot.
     assert teleop_pipe.resets == 4
     rows = json.loads((tmp_path / "meta" / episodic.OUTCOMES).read_text())
+    common = {"task": "t", "start": {"at": 100.0}}
     assert rows == [
         {
             "episode_index": 0,
@@ -731,7 +744,7 @@ def test_episodic_intervention_records_policy_and_takeover_with_outcomes(tmp_pat
             "frames": 7,
             "intervention_frames": 2,
             "interventions": 1,
-            "start": {"at": 100.0},
+            **common,
         },
         {
             "episode_index": 1,
@@ -739,9 +752,70 @@ def test_episodic_intervention_records_policy_and_takeover_with_outcomes(tmp_pat
             "frames": 1,
             "intervention_frames": 0,
             "interventions": 0,
-            "start": {"at": 100.0},
+            **common,
         },
     ]
+
+
+def test_episodic_control_channel_starts_the_session_and_picks_the_task(tmp_path, monkeypatch):
+    from lerobot.rollout import EpisodicStrategyConfig
+    from lerobot.rollout.control import request
+    from lerobot.rollout.strategies import EpisodicStrategy, episodic
+
+    monkeypatch.setattr(episodic, "VideoEncodingManager", lambda dataset: contextlib.nullcontext())
+    replies = {}
+
+    class Operator(_Scripted):
+        """Commands over the socket, as lerobot-rollout-tui sends them, at given ticks."""
+
+        def get_observation(self):
+            obs = super().get_observation()
+            port = self.strategy._control._server.server_address[1]
+            for cmd, arg in self.commands.get(self.tick, []):
+                replies[(self.tick, cmd)] = request(port, cmd, arg)
+            return obs
+
+    # t0: ready, nothing recorded; the task is chosen, a typo refused, then "next" starts.
+    # t1-3: the attempt, marked a success over the channel at t3.
+    robot = Operator(events_at={}, engaged_at=set())
+    robot.commands = {
+        0: [("task", "remove"), ("task", "remvoe"), ("next", None)],
+        3: [("success", None)],
+    }
+    ctx, _ = _episodic_ctx(
+        tmp_path, robot, None, num_episodes=1, tasks=["insert", "remove"], single_task="insert"
+    )
+    strategy = EpisodicStrategy(
+        EpisodicStrategyConfig(intervention=True, smooth_handover=False, control_port=0)
+    )
+    robot.strategy = strategy
+    strategy.setup(ctx)
+    assert strategy._state()["phase"] == "starting"
+    strategy.run(ctx)
+    strategy._control.stop()
+
+    assert replies[(0, "task")]["ok"] is False, "the last task reply is the refused typo"
+    assert "not one of the policy's tasks" in replies[(0, "task")]["error"]
+    assert replies[(0, "next")]["state"]["phase"] == "ready"
+    assert replies[(0, "next")]["state"]["next_task"] == "remove"
+    (episode,) = ctx.data.dataset.episodes
+    assert {f["task"] for f in episode} == {"remove"}, "recorded under the task it was asked"
+    assert ctx.policy.inference.task == "remove", "and the policy was asked it"
+    # The ready phase handed the robot to the teleop, which put it at 50.
+    assert [f["action"].tolist() for f in episode] == [[51, 0], [52, 0], [53, 0]]
+    state = strategy._state()
+    assert state["session"]["by_task"] == {"insert": [0, 0, 0], "remove": [1, 0, 0]}
+
+
+def test_episodic_refuses_a_task_the_policy_was_not_trained_on(tmp_path):
+    from lerobot.rollout import EpisodicStrategyConfig
+    from lerobot.rollout.strategies import EpisodicStrategy
+
+    ctx, _ = _episodic_ctx(
+        tmp_path, _Scripted({}, set()), None, num_episodes=1, tasks=["insert"], single_task="pick"
+    )
+    with pytest.raises(ValueError, match="trained on"):
+        EpisodicStrategy(EpisodicStrategyConfig()).setup(ctx)
 
 
 def test_dagger_takeover_restarts_the_teleop_pipeline_where_the_robot_is():

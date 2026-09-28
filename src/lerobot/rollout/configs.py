@@ -136,6 +136,7 @@ class EpisodicStrategyConfig(RolloutStrategyConfig):
         s / f        — mark the episode a success / failure (and end it, when it is running);
                        saved with the episode in ``meta/episode_outcomes.json``
         Space        — with ``intervention``: hold the arm / hand it back to the policy
+        t            — the next attempt's task, cycling the policy's training tasks
 
     In between episodes:
     - if there is no teleop leader, the robot is held at its initial joint positions captured at startup.
@@ -170,6 +171,11 @@ class EpisodicStrategyConfig(RolloutStrategyConfig):
     # Let the teleoperator's intervention signal take the arm mid-episode (see the docstring).
     # Needs a teleop with ``get_teleop_events``.
     intervention: bool = False
+
+    # Serve the commands and the state on 127.0.0.1:<port> for ``lerobot-rollout-tui``
+    # (lerobot.rollout.control) instead of reading the keyboard, and wait in a "ready" phase
+    # before the first attempt.
+    control_port: int | None = None
 
 
 @RolloutStrategyConfig.register_subclass("dagger")
