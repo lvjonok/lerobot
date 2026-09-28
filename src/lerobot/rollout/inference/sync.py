@@ -41,10 +41,20 @@ logger = logging.getLogger(__name__)
 # chunk with ``predict_action_chunk``, postprocesses it at once against that
 # observation's anchor, and serves the first ``n_action_steps`` from a local
 # FIFO.  This bypasses ``select_action``, so the two policies that need it are
-# refused: ACT with temporal ensembling (the ensembler lives in
+# refused: ACT with its own temporal ensembling (the ensembler lives in
 # ``select_action``, and it would average chunks anchored at different states),
 # and policies with observation-history queues (the Diffusion family fills
 # ``_queues`` as a side effect of ``select_action``).
+#
+# ``temporal_ensemble_coeff`` on the engine is the ensembling that is right for
+# relative chunks: a whole chunk is predicted EVERY tick and made absolute by the
+# postprocessor against that tick's anchor, and the command is the weighted mean
+# of the rows the still-open chunks hold for this tick, ACT's weighting
+# ``exp(-coeff * i)`` from the oldest.  Blending after composition is what makes
+# it correct: every contributor is in the robot's frame.  The mean is elementwise,
+# so a rotation carried as matrix entries (rot6d) comes out slightly off the
+# manifold -- for the nearby rotations successive chunks predict, their chordal
+# mean up to the re-orthonormalisation the robot applies on receipt.
 
 
 class SyncInferenceEngine(InferenceEngine):
@@ -65,6 +75,7 @@ class SyncInferenceEngine(InferenceEngine):
         task: str,
         device: str | None,
         robot_type: str,
+        temporal_ensemble_coeff: float | None = None,
     ) -> None:
         self._policy = policy
         self._preprocessor = preprocessor
@@ -85,6 +96,13 @@ class SyncInferenceEngine(InferenceEngine):
             for step in getattr(preprocessor, "steps", ())
         )
         self._chunk: deque[torch.Tensor] = deque()
+        self._ensemble_coeff = temporal_ensemble_coeff
+        self._open: list[list] = []  # [absolute chunk (T, D), age]
+        if temporal_ensemble_coeff is not None and not self._relative:
+            raise ValueError(
+                "inference.temporal_ensemble_coeff blends relative-action chunks after they are "
+                "made absolute; for any other policy use the policy's own temporal_ensemble_coeff"
+            )
         if self._relative:
             if getattr(policy.config, "temporal_ensemble_coeff", None) is not None:
                 raise ValueError(
@@ -97,10 +115,11 @@ class SyncInferenceEngine(InferenceEngine):
                     f"observation-history queues ({type(policy).__name__}) yet."
                 )
         logger.info(
-            "SyncInferenceEngine initialized (device=%s, action_keys=%d, relative=%s)",
+            "SyncInferenceEngine initialized (device=%s, action_keys=%d, relative=%s, ensemble=%s)",
             self._device,
             len(ordered_action_keys),
             self._relative,
+            temporal_ensemble_coeff,
         )
 
     def start(self) -> None:
@@ -118,6 +137,7 @@ class SyncInferenceEngine(InferenceEngine):
         self._preprocessor.reset()
         self._postprocessor.reset()
         self._chunk.clear()
+        self._open.clear()
 
     def get_action(self, obs_frame: dict | None) -> torch.Tensor | None:
         """Run the full inference pipeline on ``obs_frame`` and return an action tensor.
@@ -127,9 +147,12 @@ class SyncInferenceEngine(InferenceEngine):
         """
         if obs_frame is None:
             return None
+        if self._relative and self._ensemble_coeff is not None:
+            return self._reorder(self._ensemble(torch.stack(self._predict_chunk(obs_frame, None))))
         if self._relative:
             if not self._chunk:
-                self._chunk.extend(self._predict_chunk(obs_frame))
+                steps = getattr(self._policy.config, "n_action_steps", None)
+                self._chunk.extend(self._predict_chunk(obs_frame, steps))
             return self._reorder(self._chunk.popleft())
         # Shallow copy is intentional: the caller (`send_next_action`) builds
         # ``obs_frame`` fresh per tick via ``build_dataset_frame``, so the
@@ -149,11 +172,22 @@ class SyncInferenceEngine(InferenceEngine):
             action = self._postprocessor(action)
         return self._reorder(action.squeeze(0).cpu())
 
-    def _predict_chunk(self, obs_frame: dict) -> list[torch.Tensor]:
+    def _ensemble(self, chunk: torch.Tensor) -> torch.Tensor:
+        """Open ``chunk`` (absolute, ``(T, D)``) and return this tick's blend of the open rows."""
+        self._open.append([chunk, 0])
+        self._open = [entry for entry in self._open if entry[1] < entry[0].shape[0]]
+        # Oldest first, as ACT weighs them: positive coeff favours the older predictions.
+        weights = torch.exp(-self._ensemble_coeff * torch.arange(len(self._open), dtype=torch.float32))
+        rows = torch.stack([c[age] for c, age in self._open])
+        for entry in self._open:
+            entry[1] += 1
+        return (weights[:, None] * rows).sum(0) / weights.sum()
+
+    def _predict_chunk(self, obs_frame: dict, steps: int | None) -> list[torch.Tensor]:
         """Predict one chunk and make it absolute against this observation's anchor.
 
         Returns:
-            The first ``n_action_steps`` actions, each ``(action_dim,)`` on the CPU.
+            The first ``steps`` actions (all, for ``None``), each ``(action_dim,)`` on the CPU.
         """
         observation = copy(obs_frame)
         autocast_ctx = (
@@ -169,8 +203,7 @@ class SyncInferenceEngine(InferenceEngine):
             # the chunk onto it before any later observation can replace it.
             observation = self._preprocessor(observation)
             chunk = self._policy.predict_action_chunk(observation)
-            steps = getattr(self._policy.config, "n_action_steps", None) or chunk.shape[1]
-            chunk = self._postprocessor(chunk[:, :steps])
+            chunk = self._postprocessor(chunk[:, : steps or chunk.shape[1]])
         return list(chunk.squeeze(0).float().cpu())
 
     def _reorder(self, action_tensor: torch.Tensor) -> torch.Tensor:

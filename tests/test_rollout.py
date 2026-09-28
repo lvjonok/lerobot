@@ -413,11 +413,14 @@ class _AnchorPost:
         pass
 
 
-def _relative_engine(policy, action_names=("x", "y"), ordered_action_keys=("x", "y")):
+def _relative_engine(
+    policy, action_names=("x", "y"), ordered_action_keys=("x", "y"), temporal_ensemble_coeff=None
+):
     from lerobot.rollout import SyncInferenceEngine
 
     pre = _AnchorPre()
     return SyncInferenceEngine(
+        temporal_ensemble_coeff=temporal_ensemble_coeff,
         policy=policy,
         preprocessor=pre,
         postprocessor=_AnchorPost(pre),
@@ -448,6 +451,61 @@ def test_sync_relative_policy_runs_whole_chunks_on_one_anchor():
     engine.reset()
     engine.get_action({"observation.state": np.array([50.0, 0.0], dtype=np.float32)})
     assert policy.calls == 3, "reset drops the rest of the chunk"
+
+
+def test_sync_relative_ensemble_blends_absolute_rows_predicted_every_tick():
+    """Each tick predicts; the command blends the open chunks' rows for it, each on its anchor."""
+    import numpy as np
+
+    policy = _ChunkPolicy(chunk_size=3, n_action_steps=2)
+    engine = _relative_engine(policy, temporal_ensemble_coeff=0.0)
+    served = []
+    for tick in range(4):
+        state = np.array([10.0 * tick, 0.0], dtype=np.float32)
+        served.append(engine.get_action({"observation.state": state})[0].item())
+
+    assert policy.calls == 4, "a prediction every tick"
+    # Chunk k, predicted at tick k from anchor 10k, holds 10k + 0.1, +0.2, +0.3 for ticks k..k+2.
+    # Tick 2 averages chunk 0's third row (0.3), chunk 1's second (10.2) and chunk 2's first
+    # (20.1); tick 3 drops chunk 0, which is used up.
+    assert served == pytest.approx([0.1, (0.2 + 10.1) / 2, (0.3 + 10.2 + 20.1) / 3, (10.3 + 20.2 + 30.1) / 3])
+
+    engine.reset()
+    assert engine.get_action({"observation.state": np.zeros(2, dtype=np.float32)})[0].item() == (
+        pytest.approx(0.1)
+    ), "reset closes every open chunk"
+
+
+def test_sync_relative_ensemble_weights_the_oldest_by_the_coefficient():
+    import math
+
+    import numpy as np
+
+    engine = _relative_engine(_ChunkPolicy(chunk_size=3), temporal_ensemble_coeff=1.0)
+    engine.get_action({"observation.state": np.zeros(2, dtype=np.float32)})
+    blended = engine.get_action({"observation.state": np.array([10.0, 0.0], dtype=np.float32)})
+    w_old, w_new = 1.0, math.exp(-1.0)
+    assert blended[0].item() == pytest.approx((w_old * 0.2 + w_new * 10.1) / (w_old + w_new))
+
+
+def test_engine_ensembling_is_for_relative_policies_only():
+    from lerobot.rollout import SyncInferenceEngine
+
+    class _Pre:
+        steps = []
+
+    with pytest.raises(ValueError, match="relative-action chunks"):
+        SyncInferenceEngine(
+            policy=_ChunkPolicy(),
+            preprocessor=_Pre(),
+            postprocessor=None,
+            dataset_features={"action": {"names": ["x", "y"]}},
+            ordered_action_keys=["x", "y"],
+            task="test",
+            device="cpu",
+            robot_type="mock",
+            temporal_ensemble_coeff=0.01,
+        )
 
 
 def test_sync_engine_names_only_the_robot_actions_a_teleop_pipeline_adds_to():

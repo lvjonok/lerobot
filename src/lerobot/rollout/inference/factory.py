@@ -60,7 +60,15 @@ class InferenceEngineConfig(draccus.ChoiceRegistry, abc.ABC):
 @InferenceEngineConfig.register_subclass("sync")
 @dataclass
 class SyncInferenceConfig(InferenceEngineConfig):
-    """Inline synchronous inference (one policy call per control tick)."""
+    """Inline synchronous inference (one policy call per control tick).
+
+    ``temporal_ensemble_coeff``, relative-action policies only: predict a chunk every tick and
+    command the weighted mean of the open chunks' rows for it, each made absolute against its
+    own anchor first (ACT's weighting, ``exp(-coeff * i)`` from the oldest; 0.01 is ACT's).
+    ``None`` runs whole chunks, ``n_action_steps`` at a time.
+    """
+
+    temporal_ensemble_coeff: float | None = None
 
 
 @InferenceEngineConfig.register_subclass("rtc")
@@ -108,6 +116,7 @@ def create_inference_engine(
             task=task,
             device=device,
             robot_type=robot_wrapper.robot_type,
+            temporal_ensemble_coeff=config.temporal_ensemble_coeff,
         )
     if isinstance(config, RTCInferenceConfig):
         return RTCInferenceEngine(
