@@ -40,11 +40,13 @@ logger = logging.getLogger(__name__)
 # chunk.  Instead the engine preprocesses one observation, predicts the whole
 # chunk with ``predict_action_chunk``, postprocesses it at once against that
 # observation's anchor, and serves the first ``n_action_steps`` from a local
-# FIFO.  This bypasses ``select_action``, so the two policies that need it are
-# refused: ACT with its own temporal ensembling (the ensembler lives in
-# ``select_action``, and it would average chunks anchored at different states),
-# and policies with observation-history queues (the Diffusion family fills
-# ``_queues`` as a side effect of ``select_action``).
+# FIFO.  This bypasses ``select_action``, so two kinds of policy are refused:
+# ACT with its own temporal ensembling (the ensembler lives in ``select_action``,
+# and it would average chunks anchored at different states), and policies that
+# condition on more than one observation (``n_obs_steps > 1``): the engine sees
+# only the observations it predicts from, a chunk apart, so a history would not
+# be the one the policy was trained on.  A policy that queues its single
+# observation (multi_task_dit) must take it through ``predict_action_chunk``.
 #
 # ``temporal_ensemble_coeff`` on the engine is the ensembling that is right for
 # relative chunks: a whole chunk is predicted EVERY tick and made absolute by the
@@ -109,10 +111,10 @@ class SyncInferenceEngine(InferenceEngine):
                     "Relative-action policies run whole chunks; temporal ensembling would average "
                     "chunks anchored at different states. Set temporal_ensemble_coeff to None."
                 )
-            if hasattr(policy, "_queues"):
+            if getattr(policy.config, "n_obs_steps", 1) > 1:
                 raise NotImplementedError(
-                    f"SyncInferenceEngine does not support relative-action policies with "
-                    f"observation-history queues ({type(policy).__name__}) yet."
+                    f"SyncInferenceEngine runs relative-action policies on one observation per "
+                    f"chunk; {type(policy).__name__} has n_obs_steps={policy.config.n_obs_steps}."
                 )
         logger.info(
             "SyncInferenceEngine initialized (device=%s, action_keys=%d, relative=%s, ensemble=%s)",

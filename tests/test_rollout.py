@@ -521,16 +521,19 @@ def test_sync_engine_names_only_the_robot_actions_a_teleop_pipeline_adds_to():
     assert action.tolist() == pytest.approx([-0.1, 0.1]), "named in dataset order, then reordered"
 
 
-def test_sync_relative_policy_refuses_temporal_ensembling_and_history_queues():
+def test_sync_relative_policy_refuses_temporal_ensembling_and_observation_history():
     ensembling = _ChunkPolicy()
     ensembling.config.temporal_ensemble_coeff = 0.01
     with pytest.raises(ValueError, match="temporal ensembling"):
         _relative_engine(ensembling)
 
-    queued = _ChunkPolicy()
+    with pytest.raises(NotImplementedError, match="n_obs_steps=2"):
+        _relative_engine(_ChunkPolicy(n_obs_steps=2))
+
+    # A policy that queues its one observation (multi_task_dit) runs.
+    queued = _ChunkPolicy(n_obs_steps=1)
     queued._queues = {}
-    with pytest.raises(NotImplementedError, match="observation-history"):
-        _relative_engine(queued)
+    _relative_engine(queued)
 
 
 # ---------------------------------------------------------------------------
