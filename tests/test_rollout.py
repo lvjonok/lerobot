@@ -369,7 +369,10 @@ class _ChunkPolicy:
 
     def __init__(self, chunk_size=5, n_action_steps=3, **config):
         self.config = SimpleNamespace(
-            n_action_steps=n_action_steps, use_amp=False, temporal_ensemble_coeff=None, **config
+            n_action_steps=n_action_steps,
+            use_amp=False,
+            temporal_ensemble_coeff=None,
+            **{"input_features": {}, **config},
         )
         self.chunk_size = chunk_size
         self.calls = 0
@@ -414,7 +417,11 @@ class _AnchorPost:
 
 
 def _relative_engine(
-    policy, action_names=("x", "y"), ordered_action_keys=("x", "y"), temporal_ensemble_coeff=None
+    policy,
+    action_names=("x", "y"),
+    ordered_action_keys=("x", "y"),
+    temporal_ensemble_coeff=None,
+    state_names=None,
 ):
     from lerobot.rollout import SyncInferenceEngine
 
@@ -424,7 +431,10 @@ def _relative_engine(
         policy=policy,
         preprocessor=pre,
         postprocessor=_AnchorPost(pre),
-        dataset_features={"action": {"names": list(action_names)}},
+        dataset_features={
+            "action": {"names": list(action_names)},
+            **({"observation.state": {"names": list(state_names)}} if state_names else {}),
+        },
         ordered_action_keys=list(ordered_action_keys),
         task="test",
         device="cpu",
@@ -519,6 +529,26 @@ def test_sync_engine_names_only_the_robot_actions_a_teleop_pipeline_adds_to():
     )
     action = engine.get_action({"observation.state": np.zeros(2, dtype=np.float32)})
     assert action.tolist() == pytest.approx([-0.1, 0.1]), "named in dataset order, then reordered"
+
+
+def test_sync_engine_feeds_the_policy_only_the_state_channels_it_was_trained_on():
+    """Recorded extras (a wrench) stay in the recording; the policy and its anchor see the pose."""
+    import numpy as np
+
+    from lerobot.configs.types import FeatureType, PolicyFeature
+
+    policy = _ChunkPolicy(
+        input_features={"observation.state": PolicyFeature(type=FeatureType.STATE, shape=(2,))}
+    )
+    engine = _relative_engine(policy, state_names=("x", "wrench_fx", "y"))
+    action = engine.get_action({"observation.state": np.array([1.0, 99.0, 2.0], dtype=np.float32)})
+    assert action.tolist() == pytest.approx([1.1, 1.9]), "anchored on x, y; the wrench skipped"
+
+    unnamed = _ChunkPolicy(
+        input_features={"observation.state": PolicyFeature(type=FeatureType.STATE, shape=(3,))}
+    )
+    with pytest.raises(ValueError, match="trained on 3"):
+        _relative_engine(unnamed, state_names=("x", "wrench_fx", "y", "ft_fx"))
 
 
 def test_sync_relative_policy_refuses_temporal_ensembling_and_observation_history():

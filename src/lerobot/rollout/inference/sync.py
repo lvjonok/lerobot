@@ -26,7 +26,7 @@ import torch
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.processor import PolicyProcessorPipeline, RelativeActionsProcessorStep
-from lerobot.utils.constants import ACTION
+from lerobot.utils.constants import ACTION, OBS_STATE
 
 from .base import InferenceEngine
 
@@ -93,6 +93,28 @@ class SyncInferenceEngine(InferenceEngine):
         self._policy_action_names = [
             name for name in dataset_features[ACTION]["names"] if name in ordered_action_keys
         ]
+        # A recording may carry state channels the policy was never trained on -- a wrench, a
+        # second force sensor -- kept for looking at later. The policy is fed the channels its
+        # robot is commanded by (those named in the action), in recorded order: the rule a
+        # training copy is narrowed by (lerobot_robot_handheld's handheld-narrow-state).
+        self._state_index = None
+        state_names = dataset_features.get(OBS_STATE, {}).get("names") or []
+        trained = policy.config.input_features.get(OBS_STATE)
+        if state_names and trained is not None and len(state_names) != trained.shape[0]:
+            index = [i for i, name in enumerate(state_names) if name in ordered_action_keys]
+            if len(index) != trained.shape[0]:
+                raise ValueError(
+                    f"{OBS_STATE} records {len(state_names)} channels and the policy was trained "
+                    f"on {trained.shape[0]}; the {len(index)} named in the action "
+                    f"({[state_names[i] for i in index]}) are not those either"
+                )
+            self._state_index = index
+            logger.info(
+                "Policy reads %d of %d state channels: %s",
+                len(index),
+                len(state_names),
+                [state_names[i] for i in index],
+            )
         self._relative = any(
             isinstance(step, RelativeActionsProcessorStep) and step.enabled
             for step in getattr(preprocessor, "steps", ())
@@ -159,7 +181,7 @@ class SyncInferenceEngine(InferenceEngine):
         # Shallow copy is intentional: the caller (`send_next_action`) builds
         # ``obs_frame`` fresh per tick via ``build_dataset_frame``, so the
         # tensor/array values are not shared with any other reader.
-        observation = copy(obs_frame)
+        observation = self._policy_view(obs_frame)
         autocast_ctx = (
             torch.autocast(device_type=self._device.type)
             if self._device.type == "cuda" and self._policy.config.use_amp
@@ -191,7 +213,7 @@ class SyncInferenceEngine(InferenceEngine):
         Returns:
             The first ``steps`` actions (all, for ``None``), each ``(action_dim,)`` on the CPU.
         """
-        observation = copy(obs_frame)
+        observation = self._policy_view(obs_frame)
         autocast_ctx = (
             torch.autocast(device_type=self._device.type)
             if self._device.type == "cuda" and self._policy.config.use_amp
@@ -207,6 +229,13 @@ class SyncInferenceEngine(InferenceEngine):
             chunk = self._policy.predict_action_chunk(observation)
             chunk = self._postprocessor(chunk[:, : steps or chunk.shape[1]])
         return list(chunk.squeeze(0).float().cpu())
+
+    def _policy_view(self, obs_frame: dict) -> dict:
+        """A shallow copy of ``obs_frame`` holding only the state channels the policy was trained on."""
+        observation = copy(obs_frame)
+        if self._state_index is not None:
+            observation[OBS_STATE] = observation[OBS_STATE][self._state_index]
+        return observation
 
     def _reorder(self, action_tensor: torch.Tensor) -> torch.Tensor:
         """Name the policy's output, then order it by ``ordered_action_keys``."""
