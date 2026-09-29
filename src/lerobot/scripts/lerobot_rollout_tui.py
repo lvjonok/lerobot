@@ -34,7 +34,7 @@ from lerobot.rollout.control import request
 HELP = [
     ("n / →", "start the next attempt / end this one or the reset"),
     ("s / f", "success / failure (ends a running attempt; re-marks during the reset)"),
-    ("space", "hold the arm / hand it back to the policy"),
+    ("space", "take the arm from the policy / hand it back"),
     ("t, 1-9", "the next attempt's task: cycle / choose"),
     ("r / ←", "discard this attempt (twice)"),
     ("q", "end the session (twice)"),
@@ -43,8 +43,7 @@ PHASE_COLOR = {
     "ready": 3,
     "walking": 3,
     "policy": 2,
-    "correcting": 4,
-    "held": 3,
+    "human": 4,
     "reset": 5,
     "saving": 5,
     "done": 1,
@@ -124,7 +123,7 @@ def _loop(screen, port: int) -> None:
         curses.KEY_RIGHT: ("next", None),
         ord("s"): ("success", None),
         ord("f"): ("failure", None),
-        ord(" "): ("hold", None),
+        ord(" "): ("takeover", None),
         ord("t"): ("task", None),
     }
     confirm = {ord("r"): "discard", curses.KEY_LEFT: "discard", ord("q"): "quit"}

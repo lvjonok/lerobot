@@ -784,9 +784,9 @@ def test_episodic_intervention_records_policy_and_takeover_with_outcomes(tmp_pat
     monkeypatch.setattr(episodic, "create_key_listener", lambda *a, **k: None)
     monkeypatch.setattr(episodic, "VideoEncodingManager", lambda dataset: contextlib.nullcontext())
 
-    # Episode 0: the policy (t0-2), a takeover (t3-4), held after release (t5), Space (t6)
-    # hands back, `s` (t7) ends it; the reset (t8) ends on the next-episode key. Episode 1:
-    # `f` on its first tick. The last episode has no reset.
+    # Episode 0: the policy (t0-2), a takeover (t3-4), released but still the teleop's (t5),
+    # Space (t6) hands back, `s` (t7) ends it; the reset (t8) ends on the next-episode key.
+    # Episode 1: `f` on its first tick. The last episode has no reset.
     robot = _Scripted(
         events_at={
             6: {"toggle_policy": True},
@@ -817,10 +817,11 @@ def test_episodic_intervention_records_policy_and_takeover_with_outcomes(tmp_pat
         [103, 0],  # the policy
         [50, 1],
         [50, 1],  # the takeover, as the teleop pipeline made it
+        [50, 0],  # released: still the teleop's, recorded as a demonstration is
         [51, 0],
         [52, 0],  # after Space: predicted from where the teleop left the arm
     ]
-    assert [bool(f["intervention"][0]) for f in first] == [False] * 3 + [True] * 2 + [False] * 2
+    assert [bool(f["intervention"][0]) for f in first] == [False] * 3 + [True] * 3 + [False] * 2
     assert [f["action"].tolist() for f in second] == [[101, 0]]
     assert starts == [-1, 8], "a start before each episode, after the reset"
     # Episode start, the takeover, the reset, the second start: each after something else
@@ -832,8 +833,8 @@ def test_episodic_intervention_records_policy_and_takeover_with_outcomes(tmp_pat
         {
             "episode_index": 0,
             "outcome": "success",
-            "frames": 7,
-            "intervention_frames": 2,
+            "frames": 8,
+            "intervention_frames": 3,
             "interventions": 1,
             **common,
         },
@@ -846,6 +847,44 @@ def test_episodic_intervention_records_policy_and_takeover_with_outcomes(tmp_pat
             **common,
         },
     ]
+
+
+def test_episodic_space_takes_the_arm_and_a_held_clutch_keeps_it(tmp_path, monkeypatch):
+    from lerobot.rollout import EpisodicStrategyConfig
+    from lerobot.rollout.strategies import EpisodicStrategy, episodic
+
+    monkeypatch.setattr(episodic, "create_key_listener", lambda *a, **k: None)
+    monkeypatch.setattr(episodic, "VideoEncodingManager", lambda dataset: contextlib.nullcontext())
+
+    # t0 the policy; t1 Space takes the arm with no clutch; t2-3 the clutch; Space at t3 is
+    # refused under the held clutch; t4 Space hands back; `s` at t5.
+    robot = _Scripted(
+        events_at={
+            1: {"toggle_policy": True},
+            3: {"toggle_policy": True},
+            4: {"toggle_policy": True},
+            5: {"outcome": "success"},
+        },
+        engaged_at={2, 3},
+    )
+    ctx, teleop_pipe = _episodic_ctx(tmp_path, robot, None, num_episodes=1)
+    strategy = EpisodicStrategy(EpisodicStrategyConfig(intervention=True, smooth_handover=False))
+    robot.strategy = strategy
+    strategy.setup(ctx)
+    strategy.run(ctx)
+
+    (episode,) = ctx.data.dataset.episodes
+    assert [f["action"].tolist() for f in episode] == [
+        [1, 0],  # the policy
+        [50, 0],  # Space: the teleop's, not engaged
+        [50, 1],
+        [50, 1],  # the clutch; the Space under it changed nothing
+        [51, 0],
+        [52, 0],  # handed back
+    ]
+    assert [bool(f["intervention"][0]) for f in episode] == [False] + [True] * 3 + [False] * 2
+    assert teleop_pipe.resets == 1, "one takeover, however it was taken"
+    assert strategy._counts["interventions"] == 1
 
 
 def test_episodic_control_channel_starts_the_session_and_picks_the_task(tmp_path, monkeypatch):

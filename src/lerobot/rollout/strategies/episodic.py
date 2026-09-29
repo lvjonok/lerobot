@@ -25,13 +25,15 @@
       Escape       — stop the recording session
       s / f        — mark the episode a success / failure: ends it while it runs, and can be
                      pressed during the reset that follows too (the last press wins)
-      Space        — with ``intervention``: hold the arm, or hand it back to the policy
+      Space        — with ``intervention``: take the arm from the policy, or hand it back
       t            — the next attempt's task: the next of the policy's training tasks
 
-- With ``intervention=true``, a teleoperator's ``TeleopEvents.IS_INTERVENTION`` takes the
-  arm mid-episode (a clutch, say): its frames go into the same episode with
-  ``intervention=True``. On release the arm holds until Space. An evaluation that records
-  the policy's own driving and every rescue of it, in one dataset.
+- With ``intervention=true``, the teleoperator takes the arm mid-episode — its
+  ``TeleopEvents.IS_INTERVENTION`` (a clutch press, say), or Space — and keeps it until Space
+  hands it back: in between it drives exactly as when recording demonstrations (a clutch that
+  is released holds the arm, the teleop's other controls — a gripper button — still act), and
+  every frame goes into the same episode with ``intervention=True``. An evaluation that
+  records the policy's own driving and every rescue of it, in one dataset.
 - ``HardwareContext.episode_start``, when given, puts the robot where each episode begins.
 - Each saved episode gets a row in ``meta/episode_outcomes.json``: its outcome, its task,
   how many times and frames the teleop took over, and what ``episode_start`` did.
@@ -82,8 +84,7 @@ OUTCOMES = "episode_outcomes.json"
 
 class _Phase(enum.Enum):
     POLICY = "policy"
-    CORRECTING = "correcting"  # the teleop drives, recorded with intervention=True
-    HELD = "held"  # nobody drives; the last command is repeated, nothing recorded
+    HUMAN = "human"  # the teleop drives, clutch engaged or not; recorded with intervention=True
 
 
 _KEYS = {
@@ -95,7 +96,7 @@ _KEYS = {
     "q": "quit",
     "s": "success",
     "f": "failure",
-    "space": "hold",
+    "space": "takeover",
     "t": "task",
 }
 """Keyboard to command: Right/Left/Esc (n/r/q) as ``lerobot-record`` has them, and the rest."""
@@ -167,7 +168,7 @@ class EpisodicStrategy(RolloutStrategy):
         else:
             self._listener = create_key_listener(
                 lambda name: self._key(name.lower()),
-                controls_help="Right/Left/Esc (n/r/q), s=success, f=failure, Space=hold/resume, t=next task",
+                controls_help="Right/Left/Esc (n/r/q), s=success, f=failure, Space=take/hand back, t=next task",
             )
         self._outcomes_path = Path(ctx.data.dataset.root) / "meta" / OUTCOMES
         if self._outcomes_path.exists():
@@ -192,7 +193,7 @@ class EpisodicStrategy(RolloutStrategy):
         elif cmd in ("success", "failure"):
             events["outcome"] = cmd
             logger.info("Outcome: %s", cmd)
-        elif cmd == "hold":
+        elif cmd == "takeover":
             events["toggle_policy"] = True
         elif cmd == "task":
             if arg is None:
@@ -368,8 +369,8 @@ class EpisodicStrategy(RolloutStrategy):
 
                         continue
 
-                    # Ended before a frame was recorded (a key at the start, or held
-                    # throughout): save_episode() raises on an empty buffer.
+                    # Ended before a frame was recorded (a key at the start): save_episode()
+                    # raises on an empty buffer.
                     if not dataset.has_pending_frames():
                         continue
                     self._phase = "saving"
@@ -418,7 +419,6 @@ class EpisodicStrategy(RolloutStrategy):
 
         phase = _Phase.POLICY
         self._phase = phase.value
-        last_sent: dict | None = None
         counts = self._counts
 
         def add(obs_processed: dict, action: dict, intervention: bool) -> None:
@@ -452,45 +452,44 @@ class EpisodicStrategy(RolloutStrategy):
 
             teleop_action = None
             if intervene:
-                active = bool(teleop.get_teleop_events().get(TeleopEvents.IS_INTERVENTION, False))
-                if active and phase != _Phase.CORRECTING:
+                clutched = bool(teleop.get_teleop_events().get(TeleopEvents.IS_INTERVENTION, False))
+                toggled = events["toggle_policy"]
+                events["toggle_policy"] = False
+                if phase == _Phase.POLICY and (clutched or toggled):
                     # Whatever the teleop pipeline last targeted, the policy has moved the arm
                     # since: start it over from where the arm is.
                     processors.teleop_action_processor.reset()
                     self._engine.pause()
-                    phase = _Phase.CORRECTING
+                    phase = _Phase.HUMAN
                     counts["interventions"] += 1
-                    logger.info("Intervention %d: the teleop has the arm", counts["interventions"])
-                elif not active and phase == _Phase.CORRECTING:
-                    phase = _Phase.HELD
-                    logger.info("Intervention released: holding; Space hands the arm to the policy")
-                if events["toggle_policy"]:
-                    events["toggle_policy"] = False
-                    if phase == _Phase.HELD:
+                    logger.info(
+                        "Intervention %d: the teleop has the arm (%s); Space hands it back",
+                        counts["interventions"],
+                        "clutch" if clutched else "Space",
+                    )
+                elif phase == _Phase.HUMAN and toggled:
+                    if clutched:
+                        # Handing back under a held clutch would take the arm again next tick.
+                        logger.info("Release the clutch before handing the arm to the policy")
+                    else:
                         # Predict afresh from where the arm is, not from before the takeover.
                         self._engine.reset()
                         interpolator.reset()
                         self._engine.resume()
                         phase = _Phase.POLICY
                         logger.info("Policy resumed")
-                    elif phase == _Phase.POLICY:
-                        self._engine.pause()
-                        phase = _Phase.HELD
-                        logger.info("Policy held; Space resumes it")
                 # Every tick, so the channels the teleop adds to the action have a value on the
                 # policy's frames too (a clutch that is not engaged, say).
                 teleop_action = processors.teleop_action_processor((teleop.get_action(), obs))
             self._phase = phase.value
 
-            if phase == _Phase.CORRECTING:
+            if phase == _Phase.HUMAN:
+                # As a demonstration is recorded: every tick, engaged or not. The pipeline holds
+                # the arm while the clutch is released and passes the teleop's other controls.
                 obs_processed = processors.robot_observation_processor(obs)
-                last_sent = processors.robot_action_processor((teleop_action, obs))
-                robot.send_action(last_sent)
+                robot.send_action(processors.robot_action_processor((teleop_action, obs)))
                 add(obs_processed, teleop_action, True)
                 self._log_telemetry(obs_processed, teleop_action, ctx.runtime)
-            elif phase == _Phase.HELD:
-                if last_sent is not None:
-                    robot.send_action(last_sent)
             else:
                 obs_processed = self._process_observation_and_notify(processors, obs)
 
@@ -500,7 +499,6 @@ class EpisodicStrategy(RolloutStrategy):
                 action_dict = send_next_action(obs_processed, obs, ctx, interpolator)
 
                 if action_dict is not None:
-                    last_sent = processors.robot_action_processor((action_dict, obs))
                     recorded = action_dict if teleop_action is None else {**teleop_action, **action_dict}
                     add(obs_processed, recorded, False)
                     self._log_telemetry(obs_processed, action_dict, ctx.runtime)

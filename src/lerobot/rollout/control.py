@@ -38,9 +38,9 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-COMMANDS = ("state", "next", "discard", "success", "failure", "hold", "task", "quit")
+COMMANDS = ("state", "next", "discard", "success", "failure", "takeover", "task", "quit")
 """What a client may ask: read; end the attempt or the reset; discard the attempt; mark it;
-hold or resume the policy; choose the next attempt's task; end the session."""
+take the arm from the policy or hand it back; choose the next attempt's task; end the session."""
 
 
 class ControlServer:

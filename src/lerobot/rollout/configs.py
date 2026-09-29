@@ -135,18 +135,19 @@ class EpisodicStrategyConfig(RolloutStrategyConfig):
         Escape       — stop recording session
         s / f        — mark the episode a success / failure (and end it, when it is running);
                        saved with the episode in ``meta/episode_outcomes.json``
-        Space        — with ``intervention``: hold the arm / hand it back to the policy
+        Space        — with ``intervention``: take the arm from the policy / hand it back
         t            — the next attempt's task, cycling the policy's training tasks
 
     In between episodes:
     - if there is no teleop leader, the robot is held at its initial joint positions captured at startup.
     - else, the robot is moved smoothly to the position of the teleop leader.
 
-    With ``intervention=True`` the teleoperator can also take the arm mid-episode, as DAgger's
-    ``input_device="teleop"`` does: while its ``TeleopEvents.IS_INTERVENTION`` is set it drives,
-    and its frames are recorded in the same episode with ``intervention=True`` (the policy's
-    with ``False``). On release the arm holds until Space hands it back to the policy, which
-    predicts afresh from where the arm is.
+    With ``intervention=True`` the teleoperator can also take the arm mid-episode: its
+    ``TeleopEvents.IS_INTERVENTION`` (a clutch press) or Space takes it, and it keeps it until
+    Space hands it back to the policy, which predicts afresh from where the arm is. In between
+    the teleop drives as when recording demonstrations — engaged or not, its other controls (a
+    gripper button) acting — and every frame is recorded in the same episode with
+    ``intervention=True`` (the policy's with ``False``).
     """
 
     # This only applies if there are no teleop leaders specified.
