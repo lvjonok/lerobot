@@ -1089,7 +1089,9 @@ def _make_loop_ctx(fps: float, multiplier: int, num_ticks: int, on_tick=None):
     dataset.root = Path("/nonexistent-lerobot-rollout-test")
     ctx = SimpleNamespace(
         runtime=SimpleNamespace(cfg=cfg, shutdown_event=shutdown_event, cadence_report=None),
-        hardware=SimpleNamespace(robot_wrapper=robot, teleop=MagicMock(), initial_position=None),
+        hardware=SimpleNamespace(
+            robot_wrapper=robot, teleop=MagicMock(), initial_position=None, episode_start=None
+        ),
         processors=SimpleNamespace(
             robot_observation_processor=MagicMock(side_effect=lambda obs: obs),
             robot_action_processor=lambda pair: pair[0],
@@ -1466,7 +1468,7 @@ def test_base_strategy_starts_the_next_sim_episode_with_fresh_policy_state():
     assert ctx.hardware.robot_wrapper.send_action.call_count == 4
 
 
-def test_episodic_run_reports_a_summary_per_episode_and_for_the_run(caplog, clock):
+def test_episodic_run_reports_a_summary_per_episode_and_for_the_run(caplog, clock, tmp_path):
     from lerobot.rollout import EpisodicStrategyConfig
     from lerobot.rollout.strategies import EpisodicStrategy
     from lerobot.utils.action_interpolator import ActionInterpolator
@@ -1490,6 +1492,7 @@ def test_episodic_run_reports_a_summary_per_episode_and_for_the_run(caplog, cloc
     strategy._engine = ctx.policy.inference
     strategy._interpolator = ActionInterpolator(multiplier=2)
     strategy._events = {"stop_recording": False, "exit_early": False, "rerecord_episode": False}
+    strategy._outcomes_path = tmp_path / "episode_outcomes.json"
 
     with caplog.at_level(logging.INFO, logger=_TIMER_LOGGER):
         strategy.run(ctx)
@@ -1501,6 +1504,174 @@ def test_episodic_run_reports_a_summary_per_episode_and_for_the_run(caplog, cloc
     # Recording still lands once per interpolation cycle over the 8 ticks.
     assert _recorded_actions(dataset) == [1.0, 2.0, 3.0, 4.0]
     assert not _timer_warnings(caplog)
+
+
+class _Arm:
+    """A one-motor arm at ``x``; each observation runs a script for that tick.
+
+    ``events_at[tick]`` is written into the strategy's events (a key press), and
+    ``commands_at[tick]`` is sent over the control channel as ``lerobot-rollout-tui`` sends it.
+    """
+
+    supports_hold = False
+    hardware_failure = None
+
+    def __init__(self, events_at=None, commands_at=None):
+        self.x, self.tick = 0.0, -1
+        self.inner = self
+        self.events_at, self.commands_at = events_at or {}, commands_at or {}
+        self.strategy = None
+        self.replies = {}
+
+    def get_observation(self):
+        from lerobot.rollout.control import request
+
+        self.tick += 1
+        for key, value in self.events_at.get(self.tick, {}).items():
+            self.strategy._events[key] = value
+        for cmd, arg in self.commands_at.get(self.tick, []):
+            port = self.strategy._control._server.server_address[1]
+            self.replies[(self.tick, cmd)] = request(port, cmd, arg)
+        return {"m.pos": self.x}
+
+    def send_action(self, action):
+        self.x = float(action["m.pos"])
+        return action
+
+
+def _episodic_ctx(tmp_path, robot, *, num_episodes, episode_start=None, tasks=None, task="t"):
+    """A rollout context around ``robot`` recording into a real dataset under ``tmp_path``.
+
+    The engine commands one past the observed position, and labels the action with the task
+    it was last given, as a real engine does.
+    """
+    from lerobot.datasets import LeRobotDataset
+
+    engine = _FakeEngine(task=task)
+
+    def act(frame):
+        engine._set_dispatched_task(engine._take_task()[0])
+        return torch.tensor([float(frame["observation.state"][0]) + 1.0])
+
+    engine.get_action.side_effect = act
+    dataset = LeRobotDataset.create(
+        "local/rollout_test", 200, features=dict(_LOOP_FEATURES), root=tmp_path / "ds", use_videos=False
+    )
+    cfg = SimpleNamespace(
+        fps=200.0,
+        interpolation_multiplier=1,
+        duration=0.0,
+        dataset=SimpleNamespace(
+            single_task=task, episode_time_s=30.0, reset_time_s=30.0, num_episodes=num_episodes
+        ),
+        task=None,
+        play_sounds=False,
+        display_data=False,
+        display_mode="rerun",
+        display_compressed_images=False,
+        display_ip=None,
+        display_port=None,
+        use_torch_compile=False,
+        interactive=False,
+        status_interval_s=0.0,
+        device="cpu",
+    )
+    ctx = SimpleNamespace(
+        runtime=SimpleNamespace(cfg=cfg, shutdown_event=threading.Event(), cadence_report=None),
+        hardware=SimpleNamespace(
+            robot_wrapper=robot, teleop=None, initial_position=None, episode_start=episode_start
+        ),
+        processors=SimpleNamespace(
+            robot_observation_processor=lambda obs: obs,
+            robot_action_processor=lambda pair: pair[0],
+            teleop_action_processor=lambda pair: pair[0],
+        ),
+        policy=SimpleNamespace(inference=engine, policy=SimpleNamespace(config=SimpleNamespace(tasks=tasks))),
+        data=SimpleNamespace(dataset=dataset, dataset_features=_LOOP_FEATURES, ordered_action_keys=["m.pos"]),
+    )
+    return ctx
+
+
+def _episodic(robot, **config):
+    from lerobot.rollout import EpisodicStrategyConfig
+    from lerobot.rollout.strategies import EpisodicStrategy
+
+    strategy = EpisodicStrategy(EpisodicStrategyConfig(reset_to_initial_position=False, **config))
+    robot.strategy = strategy
+    return strategy
+
+
+def test_episodic_files_outcomes_and_starts_and_skips_an_empty_attempt(tmp_path, monkeypatch):
+    import json
+
+    from lerobot.rollout.strategies import episodic
+
+    monkeypatch.setattr(episodic, "create_key_listener", lambda *a, **k: None)
+    # Attempt 0: ticks 0-2, `s` at tick 2 ends it; the reset ends on the next-episode key (t3).
+    # Attempt 1 ends before its first tick (a key during its start): nothing recorded, not saved.
+    # Attempt 2: `f` on its first tick (t4). The last episode has no reset.
+    robot = _Arm(events_at={2: {"outcome": "success"}, 3: {"exit_early": True}, 4: {"outcome": "failure"}})
+    calls = []
+
+    def episode_start(r):
+        calls.append(r.tick)
+        r.x = 100.0
+        if len(calls) == 2:
+            r.strategy._events["exit_early"] = True
+        return {"call": len(calls)}
+
+    ctx = _episodic_ctx(tmp_path, robot, num_episodes=2, episode_start=episode_start)
+    strategy = _episodic(robot)
+    strategy.setup(ctx)
+    strategy.run(ctx)
+
+    dataset = ctx.data.dataset
+    assert dataset.num_episodes == 2
+    assert calls == [-1, 3, 3], "a start before each attempt, after the reset"
+    rows = json.loads((tmp_path / "ds" / "meta" / episodic.OUTCOMES).read_text())
+    assert rows == [
+        {"episode_index": 0, "outcome": "success", "task": "t", "frames": 3, "start": {"call": 1}},
+        {"episode_index": 1, "outcome": "failure", "task": "t", "frames": 1, "start": {"call": 3}},
+    ]
+    dataset.finalize()
+
+
+def test_episodic_control_channel_starts_the_session_and_picks_the_task(tmp_path):
+    # t0: ready, nothing recorded; the task is chosen, a typo refused, then "next" starts.
+    # t1-3: the attempt, marked a success over the channel at t3.
+    robot = _Arm(
+        commands_at={
+            0: [("task", "remove"), ("task", "remvoe"), ("next", None)],
+            3: [("success", None)],
+        }
+    )
+    ctx = _episodic_ctx(tmp_path, robot, num_episodes=1, tasks=["insert", "remove"], task="insert")
+    strategy = _episodic(robot, control_port=0)
+    strategy.setup(ctx)
+    assert strategy._state()["phase"] == "starting"
+    strategy.run(ctx)
+    strategy._control.stop()
+
+    replies = robot.replies
+    assert replies[(0, "task")]["ok"] is False, "the last task reply is the refused typo"
+    assert "not one of the policy's tasks" in replies[(0, "task")]["error"]
+    assert replies[(0, "next")]["state"]["phase"] == "ready"
+    assert replies[(0, "next")]["state"]["next_task"] == "remove"
+    assert replies[(3, "success")]["state"]["frames"] == 2, "the reply comes before tick 3 records"
+    assert ctx.policy.inference.task == "remove", "the policy was asked the attempt's task"
+    dataset = ctx.data.dataset
+    assert dataset.num_episodes == 1
+    dataset.finalize()
+    assert set(dataset.meta.tasks.index) == {"remove"}, "recorded under the task it was asked"
+    assert strategy._state()["session"]["by_task"] == {"insert": [0, 0, 0], "remove": [1, 0, 0]}
+
+
+def test_episodic_refuses_a_task_the_policy_was_not_trained_on(tmp_path):
+    robot = _Arm()
+    ctx = _episodic_ctx(tmp_path, robot, num_episodes=1, tasks=["insert"], task="pick")
+    with pytest.raises(ValueError, match="trained on"):
+        _episodic(robot).setup(ctx)
+    ctx.data.dataset.finalize()
 
 
 # ---------------------------------------------------------------------------

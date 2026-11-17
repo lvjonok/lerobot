@@ -182,6 +182,9 @@ class EpisodicStrategyConfig(RolloutStrategyConfig):
         Right arrow  — end current episode or reset phase early
         Left arrow   — discard current episode and re-record
         Escape       — stop recording session
+        s / f        — mark the episode a success / failure (and end it, when it is running);
+                       saved with the episode in ``meta/episode_outcomes.json``
+        t            — the next attempt's task, cycling the policy's training tasks
 
     In between episodes:
     - if there is no teleop leader, the robot is held at its initial joint positions captured at startup.
@@ -209,6 +212,11 @@ class EpisodicStrategyConfig(RolloutStrategyConfig):
     # pose on engage: the handover is already continuous there, and the blocking
     # interpolation only delays the start of the reset phase.
     smooth_handover: bool = True
+
+    # Serve the commands and the state on 127.0.0.1:<port> for ``lerobot-rollout-tui``
+    # (lerobot.rollout.control) instead of reading the keyboard, and wait in a "ready" phase
+    # before the first attempt.
+    control_port: int | None = None
 
 
 @RolloutStrategyConfig.register_subclass("dagger")

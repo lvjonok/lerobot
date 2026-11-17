@@ -28,7 +28,7 @@ from collections.abc import Callable
 from copy import copy
 from dataclasses import dataclass, field, replace
 from threading import Event
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -221,6 +221,9 @@ class HardwareContext:
     robot_wrapper: ThreadSafeRobot
     teleop: Teleoperator | None
     initial_position: dict[str, float] | None = None
+    # Puts the robot where an episode starts (episodic strategy), and returns what it did, to be
+    # filed with the episode. ``None``: an episode starts wherever the robot is.
+    episode_start: Callable[[ThreadSafeRobot], dict[str, Any]] | None = None
 
 
 @dataclass

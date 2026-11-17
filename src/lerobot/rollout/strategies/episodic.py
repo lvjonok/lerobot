@@ -23,6 +23,18 @@
       Right arrow  — end the current episode or reset phase early
       Left arrow   — discard the current episode and re-record it
       Escape       — stop the recording session
+      s / f        — mark the episode a success / failure: ends it while it runs, and can be
+                     pressed during the reset that follows too (the last press wins)
+      t            — the next attempt's task: the next of the policy's training tasks
+
+- ``HardwareContext.episode_start``, when given, puts the robot where each episode begins.
+- Each saved episode gets a row in ``meta/episode_outcomes.json``: its outcome, its task, its
+  frame count, and what ``episode_start`` did.
+- A policy trained on several tasks (``config.tasks``) is asked one per attempt, chosen
+  between attempts; frames are recorded under the task the attempt was asked.
+- ``control_port``: the same commands, and the state, over :mod:`lerobot.rollout.control`
+  for ``lerobot-rollout-tui`` instead of the keyboard, and a "ready" phase before the first
+  attempt, so the session starts when the operator says.
 
 Dataset naming follows the rollout convention: repo names must start with ``rollout_``.
 """
@@ -30,8 +42,10 @@ Dataset naming follows the rollout convention: repo names must start with ``roll
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import time
+from pathlib import Path
 
 from lerobot.common.control_utils import (
     follower_smooth_move_to,
@@ -46,17 +60,34 @@ from lerobot.teleoperators import Teleoperator
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.cycle_timer import CycleTimer
 from lerobot.utils.feature_utils import build_dataset_frame
-from lerobot.utils.keyboard_input import init_keyboard_listener
+from lerobot.utils.keyboard_input import apply_recording_control, create_key_listener
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import log_say
 from lerobot.utils.visualization_utils import log_visualization_data
 
 from ..configs import EpisodicStrategyConfig
 from ..context import RolloutContext
+from ..control import ControlServer
 from ..robot_wrapper import ThreadSafeRobot
 from .core import RolloutStrategy, safe_push_to_hub, send_next_action
 
 logger = logging.getLogger(__name__)
+
+OUTCOMES = "episode_outcomes.json"
+"""Per saved episode, in ``meta/``: outcome, task, frames, and the start it was given."""
+
+_KEYS = {
+    "right": "next",
+    "n": "next",
+    "left": "discard",
+    "r": "discard",
+    "esc": "quit",
+    "q": "quit",
+    "s": "success",
+    "f": "failure",
+    "t": "task",
+}
+"""Keyboard to command: Right/Left/Esc (n/r/q) as ``lerobot-record`` has them, and the rest."""
 
 
 class EpisodicStrategy(RolloutStrategy):
@@ -84,12 +115,31 @@ class EpisodicStrategy(RolloutStrategy):
     def __init__(self, config: EpisodicStrategyConfig) -> None:
         super().__init__(config)
         self._listener = None
-        self._events: dict[str, bool] | None = None
+        self._events: dict | None = None
+        self._outcomes: list[dict] = []
+        self._outcomes_path: Path | None = None
+        self._session_start = 0
+        self._control: ControlServer | None = None
+        self._tasks: list[str] = []
+        self._task: str | None = None
+        self._next_task: str | None = None
+        self._phase = "starting"
+        self._attempt_t0: float | None = None
+        self._frames = 0
+        self._index = 0
+        self._episode_time_s = 0.0
 
     def setup(self, ctx: RolloutContext) -> None:
-        """Start the inference engine and attach the keyboard listener."""
-        self._init_engine(ctx)
+        """Start the inference engine and attach the keyboard listener or the control channel."""
         cfg = ctx.runtime.cfg
+        asked = cfg.dataset.single_task or cfg.task
+        # A policy trained on several tasks lists them; any other is asked what it was given.
+        policy_config = getattr(ctx.policy.policy, "config", None)  # None with remote inference
+        self._tasks = list(getattr(policy_config, "tasks", None) or [asked])
+        if asked not in self._tasks:
+            raise ValueError(f"the policy was trained on {self._tasks}; the task given is {asked!r}")
+        self._task = self._next_task = asked
+        self._init_engine(ctx)
         # --duration caps a single episode, not the whole session (the session ends
         # after --dataset.num_episodes episodes).
         if cfg.duration > 0:
@@ -103,8 +153,79 @@ class EpisodicStrategy(RolloutStrategy):
             else:
                 logger.info("Propagating --duration=%s to --dataset.episode_time_s", cfg.duration)
                 dataset_cfg.episode_time_s = cfg.duration
-        self._listener, self._events = init_keyboard_listener()
-        logger.info("Episodic strategy ready")
+        self._episode_time_s = self._require_dataset_cfg(cfg).episode_time_s
+        self._events = {
+            "exit_early": False,
+            "rerecord_episode": False,
+            "stop_recording": False,
+            "outcome": None,
+        }
+        if self.config.control_port is not None:
+            self._control = ControlServer(self.config.control_port, self._command, self._state)
+            self._control.start()
+        else:
+            self._listener = create_key_listener(
+                lambda name: self._key(name.lower()),
+                controls_help="Right/Left/Esc (n/r/q), s=success, f=failure, t=next task",
+            )
+        dataset = self._require_dataset(ctx.data)
+        self._outcomes_path = Path(dataset.root) / "meta" / OUTCOMES
+        if self._outcomes_path.exists():
+            self._outcomes = json.loads(self._outcomes_path.read_text())
+        self._session_start = len(self._outcomes)
+        self._index = dataset.num_episodes
+        logger.info("Episodic strategy ready; tasks %s", self._tasks)
+
+    def _key(self, name: str) -> None:
+        if name in _KEYS:
+            self._command(_KEYS[name], None)
+
+    def _command(self, cmd: str, arg) -> None:
+        """Apply one operator command (a key, or the control channel's).
+
+        Raises:
+            ValueError: A task the policy was not trained on.
+        """
+        events = self._events
+        if cmd in ("next", "discard", "quit"):
+            apply_recording_control({"next": "right", "discard": "left", "quit": "esc"}[cmd], events)
+        elif cmd in ("success", "failure"):
+            events["outcome"] = cmd
+            logger.info("Outcome: %s", cmd)
+        elif cmd == "task":
+            if arg is None:
+                arg = self._tasks[(self._tasks.index(self._next_task) + 1) % len(self._tasks)]
+            if arg not in self._tasks:
+                raise ValueError(f"{arg!r} is not one of the policy's tasks {self._tasks}")
+            self._next_task = arg
+            logger.info("Next attempt's task: %s", arg)
+
+    def _state(self) -> dict:
+        """What the control channel reports."""
+        session = self._outcomes[self._session_start :]
+        return {
+            "phase": self._phase,
+            "episode": self._index,
+            "elapsed_s": None if self._attempt_t0 is None else time.perf_counter() - self._attempt_t0,
+            "episode_time_s": self._episode_time_s,
+            "task": self._task,
+            "next_task": self._next_task,
+            "tasks": self._tasks,
+            "outcome": self._events["outcome"] if self._events else None,
+            "frames": self._frames,
+            "session": {
+                "episodes": len(session),
+                "success": sum(r["outcome"] == "success" for r in session),
+                "failure": sum(r["outcome"] == "failure" for r in session),
+                "by_task": {
+                    t: [
+                        sum(r["outcome"] == o for r in session if r.get("task") == t)
+                        for o in ("success", "failure", None)
+                    ]
+                    for t in self._tasks
+                },
+            },
+        }
 
     def run(self, ctx: RolloutContext) -> None:
         """Main multi-episode recording loop."""
@@ -137,14 +258,41 @@ class EpisodicStrategy(RolloutStrategy):
 
         with VideoEncodingManager(dataset):
             try:
+                if self._control is not None:
+                    # The session starts when the operator says: the reset loop, nothing recorded.
+                    self._phase = "ready"
+                    self._reset_loop(
+                        ctx=ctx,
+                        robot=robot,
+                        teleop=teleop,
+                        events=events,
+                        fps=fps,
+                        control_time_s=float("inf"),
+                        display_data=cfg.display_data,
+                        display_mode=cfg.display_mode,
+                        display_compressed=display_compressed,
+                    )
                 recorded_episodes = 0
                 while recorded_episodes < num_episodes and not events["stop_recording"]:
                     if ctx.runtime.shutdown_event.is_set():
                         break
 
+                    self._task = self._next_task
+                    self._require_engine().set_task(self._task)
+                    self._index = dataset.num_episodes
+                    self._frames = 0
+                    start = None
+                    if ctx.hardware.episode_start is not None:
+                        self._phase = "walking"
+                        start = ctx.hardware.episode_start(robot)
+                    events["outcome"] = None
+
                     self._start_episode(robot, timer)
 
                     log_say(f"Recording episode {dataset.num_episodes}", play_sounds)
+                    logger.info("Attempt %d: %s", dataset.num_episodes, self._task)
+                    self._phase = "policy"
+                    self._attempt_t0 = time.perf_counter()
                     self._policy_loop(
                         ctx=ctx,
                         robot=robot,
@@ -154,12 +302,15 @@ class EpisodicStrategy(RolloutStrategy):
                         control_time_s=episode_time_s,
                         dataset=dataset,
                     )
+                    self._attempt_t0 = None
+                    frames = self._frames
 
                     # Reset phase, skip after the last episode (but run when re-recording)
                     if not events["stop_recording"] and (
                         recorded_episodes < num_episodes - 1 or events["rerecord_episode"]
                     ):
                         log_say("Reset the environment", play_sounds)
+                        self._phase = "reset"
 
                         if teleop:
                             # Smooth handover so the transition to teleop control is jerk-free.
@@ -207,6 +358,7 @@ class EpisodicStrategy(RolloutStrategy):
                         log_say("Re-record episode", play_sounds)
                         events["rerecord_episode"] = False
                         events["exit_early"] = False
+                        events["outcome"] = None
                         dataset.clear_episode_buffer()
                         timer.log_episode_summary("discarded episode")
 
@@ -216,10 +368,27 @@ class EpisodicStrategy(RolloutStrategy):
 
                         continue
 
+                    # Ended before a frame was recorded (a key at the start): save_episode()
+                    # raises on an empty buffer.
+                    if not dataset.has_pending_frames():
+                        continue
+                    self._phase = "saving"
+                    index = dataset.num_episodes
                     dataset.save_episode()
                     recorded_episodes += 1
                     timer.log_episode_summary(f"episode {dataset.num_episodes}")
+                    self._file_outcome(
+                        {
+                            "episode_index": index,
+                            "outcome": events["outcome"],
+                            "task": self._task,
+                            "frames": frames,
+                            "start": start,
+                        }
+                    )
+                    self._index = dataset.num_episodes
             finally:
+                self._phase = "done"
                 # Save any frames buffered in the current episode so an unexpected
                 # exception or KeyboardInterrupt does not silently drop recorded data.
                 # suppress: save_episode raises if the buffer is empty (nothing to lose).
@@ -254,6 +423,8 @@ class EpisodicStrategy(RolloutStrategy):
             if events["exit_early"]:
                 events["exit_early"] = False
                 break
+            if events.get("outcome") is not None:
+                break
 
             if ctx.runtime.shutdown_event.is_set():
                 break
@@ -282,6 +453,7 @@ class EpisodicStrategy(RolloutStrategy):
                         dataset.add_frame(
                             {**obs_frame, **action_frame, "task": self._require_engine().dispatched_task}
                         )
+                        self._frames += 1
 
             # End the recorded episode when the sim robot's episode ends (success, failure or step limit).
             if episode_ended(robot.inner):
@@ -342,6 +514,17 @@ class EpisodicStrategy(RolloutStrategy):
             precise_sleep(max(sleep_t, 0.0))
             timestamp = time.perf_counter() - start_t
 
+    def _file_outcome(self, row: dict) -> None:
+        """Append one saved episode's row to ``meta/episode_outcomes.json``."""
+        self._outcomes.append(row)
+        self._outcomes_path.write_text(json.dumps(self._outcomes, indent=2))
+        logger.info(
+            "Episode %d saved: %s, %d frames",
+            row["episode_index"],
+            row["outcome"] or "no outcome marked",
+            row["frames"],
+        )
+
     def teardown(self, ctx: RolloutContext) -> None:
         """Finalise dataset, stop listener, push to hub, and disconnect hardware."""
         cfg = ctx.runtime.cfg
@@ -349,8 +532,20 @@ class EpisodicStrategy(RolloutStrategy):
 
         log_say("Stop recording", play_sounds, blocking=True)
 
+        session = self._outcomes[self._session_start :]
+        if session:
+            marked = [r for r in session if r["outcome"] is not None]
+            logger.info(
+                "This session: %d episode(s), %d/%d marked a success",
+                len(session),
+                sum(r["outcome"] == "success" for r in marked),
+                len(marked),
+            )
+
         if self._listener is not None:
             self._listener.stop()
+        if self._control is not None:
+            self._control.stop()
 
         if ctx.data.dataset is not None:
             logger.info("Finalizing dataset...")

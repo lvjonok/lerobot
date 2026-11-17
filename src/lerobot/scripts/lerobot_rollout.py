@@ -167,7 +167,7 @@ Usage examples
 import logging
 import threading
 from collections.abc import Callable
-from typing import cast
+from typing import Any, cast
 
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
@@ -200,6 +200,7 @@ from lerobot.rollout import (
     build_rollout_context,
     create_strategy,
 )
+from lerobot.rollout.robot_wrapper import ThreadSafeRobot
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
@@ -225,8 +226,12 @@ logger = logging.getLogger(__name__)
 
 
 @parser.wrap()
-def rollout(cfg: RolloutConfig):
-    """Main entry point for policy deployment."""
+def rollout(cfg: RolloutConfig, episode_start: Callable[[ThreadSafeRobot], dict[str, Any]] | None = None):
+    """Main entry point for policy deployment.
+
+    ``episode_start`` puts the robot where each episode of the episodic strategy begins
+    (``HardwareContext.episode_start``).
+    """
     init_logging(console_level=cfg.inference.log_level)
 
     if cfg.display_data:
@@ -249,6 +254,7 @@ def rollout(cfg: RolloutConfig):
 
     logger.info("Building rollout context...")
     ctx = build_rollout_context(cfg, shutdown_event)
+    ctx.hardware.episode_start = episode_start
 
     strategy = create_strategy(cfg.strategy)
     logger.info("Rollout strategy: %s", cfg.strategy.type)
