@@ -1561,6 +1561,9 @@ def _fake_relative_policy(chunk_rel, n_action_steps):
     policy = MagicMock()
     policy.config.use_amp = False
     policy.config.action_feature_names = list(_REL_ACTION_NAMES)
+    policy.config.n_obs_steps = 1
+    policy.config.n_action_steps = n_action_steps
+    policy.config.temporal_ensemble_coeff = None
     state = {"predict_calls": 0}
     queue = deque(maxlen=n_action_steps)
 
@@ -1651,6 +1654,95 @@ def test_sync_engine_without_a_relative_step_binds_nothing():
     policy.config.use_amp = False
     assert bind_relative_anchor(policy, MagicMock(steps=[])) is None
     _build_sync_engine(policy, MagicMock(steps=[]), MagicMock())  # must not raise
+
+
+class _ChunkPolicy:
+    """Predicts ``±[1, 2, 3, ...] * 0.1`` as a chunk of relative steps, counting its calls."""
+
+    def __init__(self, chunk_size=5, n_action_steps=3, n_obs_steps=1):
+        self.config = SimpleNamespace(
+            n_action_steps=n_action_steps,
+            n_obs_steps=n_obs_steps,
+            use_amp=False,
+            temporal_ensemble_coeff=None,
+        )
+        self.chunk_size = chunk_size
+        self.calls = 0
+
+    def reset(self):
+        pass
+
+    def predict_action_chunk(self, batch):
+        self.calls += 1
+        steps = torch.arange(1, self.chunk_size + 1, dtype=torch.float32) * 0.1
+        return torch.stack([steps, -steps], dim=-1).unsqueeze(0)
+
+
+class _AnchorPre:
+    """A preprocessor whose enabled relative step re-caches the state on every observation."""
+
+    def __init__(self):
+        from lerobot.processor import RelativeActionsProcessorStep
+
+        self.steps = [RelativeActionsProcessorStep(enabled=True)]
+        self.anchor = None
+
+    def __call__(self, observation):
+        self.anchor = observation["observation.state"].clone()
+        return observation
+
+    def reset(self):
+        pass
+
+
+class _AnchorPost:
+    """Composes a relative chunk onto the anchor the preprocessor cached."""
+
+    def __init__(self, pre):
+        self.pre = pre
+
+    def __call__(self, action):
+        return action + self.pre.anchor.view(1, 1, -1)
+
+    def reset(self):
+        pass
+
+
+def test_sync_relative_policy_runs_whole_chunks_on_one_anchor():
+    """A chunk's actions are composed onto the state it was predicted from, not a later one."""
+    import numpy as np
+
+    def engine_for(policy):
+        pre = _AnchorPre()
+        return SyncInferenceEngine(
+            policy,
+            pre,
+            _AnchorPost(pre),
+            {"action": {"names": ["x", "y"]}},
+            ["x", "y"],
+            "test",
+            "cpu",
+            "mock",
+        )
+
+    policy = _ChunkPolicy(chunk_size=5, n_action_steps=3)
+    engine = engine_for(policy)
+    served = []
+    for tick in range(6):
+        # The arm moves between ticks; only the observation a chunk starts from anchors it.
+        state = np.array([10.0 * tick, 0.0], dtype=np.float32)
+        served.append(engine.get_action({"observation.state": state}).tolist())
+
+    assert policy.calls == 2, "one prediction per n_action_steps"
+    expected = [[0.1, -0.1], [0.2, -0.2], [0.3, -0.3], [30.1, -0.1], [30.2, -0.2], [30.3, -0.3]]
+    assert served == [pytest.approx(row) for row in expected]
+
+    engine.reset()
+    engine.get_action({"observation.state": np.array([50.0, 0.0], dtype=np.float32)})
+    assert policy.calls == 3, "reset drops the rest of the chunk"
+
+    # An observation history lives in select_action: such a policy keeps the per-tick path.
+    assert not engine_for(_ChunkPolicy(n_obs_steps=2))._relative
 
 
 # ---------------------------------------------------------------------------
