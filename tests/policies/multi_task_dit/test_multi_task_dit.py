@@ -373,6 +373,30 @@ def test_multi_task_dit_policy_select_action(batch_size: int, state_dim: int, ac
         assert processed_action.shape == (batch_size, action_dim)
 
 
+def test_multi_task_dit_predict_action_chunk_takes_the_observation():
+    """A caller asking only for chunks gets the chunk select_action serves from that observation."""
+    config = create_config(state_dim=6, action_dim=6, n_obs_steps=2, horizon=16, n_action_steps=8)
+    config.normalization_mapping = {
+        "VISUAL": NormalizationMode.IDENTITY,
+        "STATE": NormalizationMode.IDENTITY,
+        "ACTION": NormalizationMode.IDENTITY,
+    }
+    policy = MultiTaskDiTPolicy(config=config)
+    policy.eval()
+    preprocessor, _ = make_multi_task_dit_pre_post_processors(config=config, dataset_stats=None)
+    observation = preprocessor(create_observation_batch(batch_size=1, state_dim=6))
+
+    policy.reset()
+    with seeded_context(0):
+        chunk = policy.predict_action_chunk(observation)
+    policy.reset()
+    with seeded_context(0):
+        served = torch.stack([policy.select_action(observation) for _ in range(8)], dim=1)
+
+    assert chunk.shape == (1, 8, 6)
+    torch.testing.assert_close(chunk, served)
+
+
 def test_multi_task_dit_policy_diffusion_objective():
     """Test policy with diffusion objective."""
     batch_size = 2

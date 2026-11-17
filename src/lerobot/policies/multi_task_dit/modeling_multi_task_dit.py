@@ -156,21 +156,32 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
         if self.config.image_features:
             self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
 
+    def _observe(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Stack the cameras and push this observation onto the history queues."""
+        batch = dict(batch)  # shallow copy to avoid modifying original
+        batch.pop(ACTION, None)
+        batch = self._prepare_batch(batch)
+        self._queues = populate_queues(self._queues, batch)
+        return batch
+
+    def _with_history(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """The batch with each queued key replaced by its last ``n_obs_steps`` observations."""
+        return {
+            k: torch.stack(list(self._queues[k]), dim=1) if k in self._queues else v for k, v in batch.items()
+        }
+
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
-        """Predict a chunk of actions given environment observations.
+        """Predict a chunk from this observation and the ``n_obs_steps - 1`` observed before it.
+
+        The observation joins the history queues here, so a caller that only ever asks for chunks
+        gets one from the observation it passed, as ``select_action`` does.
 
         `noise` is the optional starting sample of shape `(B, horizon, action_dim)`. The DDPM scheduler still
         adds fresh noise at every step, so only DDIM and flow matching are fully driven by `noise`.
         """
         self.eval()
-
-        for k in batch:
-            if k in self._queues:
-                batch[k] = torch.stack(list(self._queues[k]), dim=1)
-
-        actions = self._generate_actions(batch, noise=noise)
-        return actions
+        return self._generate_actions(self._with_history(self._observe(batch)), noise=noise)
 
     def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """Prepare batch by stacking image features if needed."""
@@ -183,16 +194,11 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
         """Select a single action given environment observations"""
-        if ACTION in batch:
-            batch = dict(batch)  # shallow copy to avoid modifying original
-            batch.pop(ACTION)
-
-        batch = self._prepare_batch(batch)
-
-        self._queues = populate_queues(self._queues, batch)
+        batch = self._observe(batch)
 
         if len(self._queues[ACTION]) == 0:
-            actions = self.predict_action_chunk(batch, noise=noise)
+            self.eval()
+            actions = self._generate_actions(self._with_history(batch), noise=noise)
             self._queues[ACTION].extend(actions.transpose(0, 1))
 
         action = self._queues[ACTION].popleft()
